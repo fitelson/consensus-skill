@@ -1,0 +1,4 @@
+interface:
+  display_name: "Consensus Debate"
+  short_description: "Run resumable Claude-Codex debates with durable recovery"
+  default_prompt: "Use $consensus to run a rigorous Claude-Codex debate with resumable sessions, an fsynced stream journal, and compressed reports."

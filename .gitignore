@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated debate artifacts may contain private prompts and context.
+*.progress.md
+*.claude-stream.jsonl
+consensus_[0-9]*.md

@@ -1,0 +1,873 @@
+#!/usr/bin/env python3
+"""
+consensus — have Claude and Codex debate a question until they agree.
+
+Each debate turn starts as an independent process. A Claude turn receives a
+stable session ID so that, if its live process is terminated after five missed
+durable checkpoints, recovery can resume that same turn without replaying or
+modifying thinking blocks. Codex replies via `codex exec`. The two trade
+messages until both endorse the current best answer, or until the round limit
+is hit.
+
+Usage:
+    consensus "your question here"
+    consensus --max-rounds 8 "your question"
+    consensus --quiet "your question"        # hide thinking, show answers only
+    echo "your question" | consensus          # question from stdin
+"""
+
+import argparse
+import json
+import os
+import queue
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import uuid
+from datetime import datetime
+
+# ---- terminal colors --------------------------------------------------------
+def _c(code):
+    return f"\033[{code}m" if sys.stdout.isatty() else ""
+
+BOLD, DIM, RESET = _c("1"), _c("2"), _c("0")
+CLAUDE_COL, CODEX_COL, SYS_COL = _c("38;5;208"), _c("38;5;39"), _c("38;5;244")
+
+# Portable package: use the recipient machine's defaults unless these optional
+# environment variables are set.
+CLAUDE_MODEL = os.environ.get("CONSENSUS_CLAUDE_MODEL")
+CLAUDE_EFFORT = os.environ.get("CONSENSUS_CLAUDE_EFFORT")
+CODEX_MODEL = os.environ.get("CONSENSUS_CODEX_MODEL")
+CODEX_REASONING_EFFORT = os.environ.get("CONSENSUS_CODEX_REASONING_EFFORT")
+REPORT_MAX_TOKENS = 40000
+
+CLAUDE_REPORT_DEADLINE = 300  # durable-work checkpoint interval
+CLAUDE_TRANCHE_THINK = 7000  # max extended-thinking tokens in one Claude tranche
+CLAUDE_RECOVERY_TIMEOUT = 120
+CLAUDE_MAX_CONSECUTIVE_MISSES = 5
+CODEX_TIMEOUT = 1200
+
+CHECKPOINT_FIELDS = (
+    "elapsed",
+    "tentative_verdict",
+    "new_results",
+    "current_obstruction",
+    "next_bounded_step",
+    "token_cost",
+)
+
+SYSTEM = """You are one of two AI systems ({me}) debating with the other ({other}) \
+to reach a correct, well-reasoned CONSENSUS answer to the user's question.
+
+Rules of the debate:
+- This process IS the requested debate. Reason and answer directly in this turn. \
+Never invoke the consensus skill or command, launch another debate, call another \
+model, or delegate your role to a sub-agent. All ordinary tools remain allowed, \
+including local files, web research, code execution, proof assistants, and \
+computer algebra. Only recursive debates and model delegation are forbidden.
+- Be rigorous. Challenge weak reasoning, concede valid points, and converge on \
+the best possible answer. Do NOT agree just to end the debate quickly, and do \
+NOT manufacture disagreement once the answer is genuinely settled.
+- Keep each message focused: state your position and the reasoning that matters, \
+not filler.
+- Claude durability rule: work in a long-lived, resumable research session. \
+The runner fsyncs every streamed event to its own durable journal and checks \
+for new activity at five-minute boundaries. It allows five consecutive silent \
+intervals before terminating the live process, then resumes the same Claude \
+session for a short no-thinking recovery report. Emit concise cumulative \
+status before extended silent work when possible. If more work remains, return \
+the best current report and use VERDICT: DISAGREE; the next debate round will \
+continue from it. Never rely only on an eventual final response to preserve work.
+- Claude checkpoint format: begin every returned debate message with exactly \
+this durable cumulative block, filling every field substantively:
+CHECKPOINT
+elapsed: <wall-clock estimate>
+tentative_verdict: <current verdict>
+new_results: <genuinely new results in this tranche, or none>
+current_obstruction: <current obstruction, or none>
+next_bounded_step: <next bounded step, or done>
+token_cost: <available token/cost figures, or unavailable>
+END CHECKPOINT
+- Participant output rule: whether you are Claude or Codex, do the full \
+reasoning needed, but return a compressed report of at most \
+{report_max_tokens} output tokens. Preserve decisive \
+arguments, proof steps, counterexamples, qualifications, and the verdict. If \
+more detail is needed, write it to a project file and report the path instead \
+of overflowing the response. This is a hard requirement for every turn.
+
+{context}QUESTION:
+{question}
+
+DEBATE SO FAR:
+{transcript}
+
+YOUR TASK THIS TURN:
+{task}
+
+End your message with EXACTLY one of these two lines, on its own line:
+VERDICT: AGREE      (you fully endorse the current best answer; nothing material to add)
+VERDICT: DISAGREE   (open issues remain that should be resolved)
+"""
+
+
+SYNTH = """The debate below, between Claude and Codex, reached CONSENSUS on the \
+user's question. Write the final agreed answer in clean, self-contained form: \
+no meta-commentary about the debate, no "we agreed" / "as Codex noted", no \
+VERDICT line — just the answer itself, at the level of detail the question \
+warrants. The synthesis must be a compressed report of at most \
+{report_max_tokens} output tokens. Preserve all material needed for the \
+agreed conclusion; put longer supporting material in a project file and return \
+its path rather than overflowing the response.
+
+{context}QUESTION:
+{question}
+
+DEBATE TRANSCRIPT:
+{transcript}
+
+FINAL AGREED ANSWER:"""
+
+
+def build_prompt(me, other, question, turns, opening, context=""):
+    if turns:
+        transcript = "\n\n".join(f"--- {t['who']} said ---\n{t['text']}" for t in turns)
+    else:
+        transcript = "(none yet — you are opening the debate.)"
+    if opening:
+        task = "Give your best initial answer to the question, with the reasoning behind it."
+    else:
+        task = (f"Respond to {other}'s most recent message. Say where you agree, push back "
+                f"where you disagree, and refine the shared answer toward correctness.")
+    return SYSTEM.format(
+        me=me, other=other, question=question, transcript=transcript,
+        task=task, context=context,
+        report_max_tokens=REPORT_MAX_TOKENS,
+    )
+
+
+def _file_signature(path):
+    if not path:
+        return None
+    try:
+        stat = os.stat(path)
+        return stat.st_size, stat.st_mtime_ns
+    except OSError:
+        return None
+
+
+def _run_streaming(cmd, env, timeout, *, checkpoint_file=None,
+                   checkpoint_interval=None, max_checkpoint_misses=None,
+                   checkpoint_event=None, stream_journal=None):
+    """Drain output continuously; monitor durable checkpoints while running."""
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=env,
+    )
+    events = queue.Queue()
+
+    def drain(name, pipe):
+        try:
+            for line in iter(pipe.readline, ""):
+                events.put((name, line))
+        finally:
+            events.put((name, None))
+            pipe.close()
+
+    threads = [
+        threading.Thread(target=drain, args=("stdout", proc.stdout), daemon=True),
+        threading.Thread(target=drain, args=("stderr", proc.stderr), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+
+    output = {"stdout": [], "stderr": []}
+    closed = set()
+    started = time.monotonic()
+    deadline = None if not timeout else started + timeout
+    next_heartbeat = started + 60
+    next_checkpoint = (
+        started + checkpoint_interval if checkpoint_interval else None
+    )
+    checkpoint_signature = _file_signature(checkpoint_file)
+    checkpoint_misses = 0
+
+    def journal_stream(name, line):
+        if not stream_journal or line is None:
+            return
+        record = {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "stream": name,
+            "line": line.rstrip("\n"),
+        }
+        with open(stream_journal, "a", encoding="utf-8") as journal:
+            journal.write(json.dumps(record, ensure_ascii=False) + "\n")
+            journal.flush()
+            os.fsync(journal.fileno())
+
+    def stop_process():
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+
+    while len(closed) < 2:
+        now = time.monotonic()
+        if deadline is not None and now >= deadline:
+            stop_process()
+            while True:
+                try:
+                    name, line = events.get_nowait()
+                except queue.Empty:
+                    break
+                if line is not None:
+                    output[name].append(line)
+                    journal_stream(name, line)
+            raise subprocess.TimeoutExpired(
+                cmd,
+                timeout,
+                output="".join(output["stdout"]),
+                stderr="".join(output["stderr"]),
+            )
+        if next_checkpoint is not None and now >= next_checkpoint:
+            current_signature = _file_signature(checkpoint_file)
+            if current_signature is not None and current_signature != checkpoint_signature:
+                checkpoint_misses = 0
+                checkpoint_signature = current_signature
+                if checkpoint_event:
+                    checkpoint_event("observed", checkpoint_misses)
+            else:
+                checkpoint_misses += 1
+                if checkpoint_event:
+                    checkpoint_event("missed", checkpoint_misses)
+                if (max_checkpoint_misses is not None
+                        and checkpoint_misses >= max_checkpoint_misses):
+                    stop_process()
+                    while True:
+                        try:
+                            name, line = events.get_nowait()
+                        except queue.Empty:
+                            break
+                        if line is not None:
+                            output[name].append(line)
+                            journal_stream(name, line)
+                    raise subprocess.TimeoutExpired(
+                        cmd,
+                        checkpoint_interval * max_checkpoint_misses,
+                        output="".join(output["stdout"]),
+                        stderr="".join(output["stderr"]),
+                    )
+            next_checkpoint += checkpoint_interval
+        if now >= next_heartbeat:
+            elapsed = int(now - started)
+            remaining = "unbounded" if deadline is None else f"{max(0, int(deadline - now))}s left"
+            print(f"{SYS_COL}{DIM}  Claude tranche: {elapsed}s elapsed, {remaining}{RESET}")
+            sys.stdout.flush()
+            next_heartbeat += 60
+        wait = 0.25
+        if deadline is not None:
+            wait = max(0.01, min(wait, deadline - now))
+        try:
+            name, line = events.get(timeout=wait)
+        except queue.Empty:
+            continue
+        if line is None:
+            closed.add(name)
+        else:
+            output[name].append(line)
+            journal_stream(name, line)
+
+    returncode = proc.wait()
+    for thread in threads:
+        thread.join(timeout=1)
+    return returncode, "".join(output["stdout"]), "".join(output["stderr"])
+
+
+def run_claude(prompt, think_budget, timeout=None, *, session_id=None,
+               resume=False, checkpoint_file=None, checkpoint_event=None,
+               stream_journal=None):
+    """Return (thinking, answer), draining Claude's stream while it runs."""
+    env = dict(os.environ)
+    if think_budget > 0:
+        env["MAX_THINKING_TOKENS"] = str(think_budget)
+    else:
+        env["CLAUDE_CODE_DISABLE_THINKING"] = "1"
+    cmd = [
+        "claude", "-p", prompt,
+        "--output-format", "stream-json", "--verbose",
+        "--include-partial-messages",
+    ]
+    if CLAUDE_MODEL:
+        cmd.extend(["--model", CLAUDE_MODEL])
+    if CLAUDE_EFFORT:
+        cmd.extend(["--effort", CLAUDE_EFFORT])
+    if session_id:
+        cmd.extend(["--resume" if resume else "--session-id", session_id])
+    returncode, stdout, stderr = _run_streaming(
+        cmd,
+        env,
+        timeout or None,
+        checkpoint_file=checkpoint_file,
+        checkpoint_interval=(CLAUDE_REPORT_DEADLINE if checkpoint_file else None),
+        max_checkpoint_misses=(
+            CLAUDE_MAX_CONSECUTIVE_MISSES if checkpoint_file else None
+        ),
+        checkpoint_event=checkpoint_event,
+        stream_journal=stream_journal,
+    )
+    if returncode != 0:
+        raise RuntimeError(f"claude exited {returncode}:\n{stderr or stdout}")
+    thinking_parts, text_parts = [], []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if obj.get("type") != "assistant":
+            continue
+        msg = obj.get("message", {})
+        content = msg.get("content")
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            if blk.get("type") == "thinking":
+                thinking_parts.append(blk.get("thinking", ""))
+            elif blk.get("type") == "text":
+                text_parts.append(blk.get("text", ""))
+    answer = "\n".join(t for t in text_parts if t).strip()
+    thinking = "\n".join(t for t in thinking_parts if t).strip()
+    if not answer:
+        raise RuntimeError("claude returned no text answer")
+    return thinking, answer
+
+
+def checkpoint_of(text):
+    """Return a validated Claude checkpoint mapping, or None."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, line in enumerate(lines) if line.strip() == "CHECKPOINT")
+        end = next(
+            i for i in range(start + 1, len(lines))
+            if lines[i].strip() == "END CHECKPOINT"
+        )
+    except StopIteration:
+        return None
+    fields = {}
+    for line in lines[start + 1:end]:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        fields[key.strip()] = value.strip()
+    if any(not fields.get(field) for field in CHECKPOINT_FIELDS):
+        return None
+    return fields
+
+
+def no_substantive_progress(checkpoint):
+    value = checkpoint["new_results"].strip().lower().rstrip(".")
+    return value in {
+        "none",
+        "no new result",
+        "no new results",
+        "nothing new",
+        "unchanged",
+        "no substantive progress",
+    }
+
+
+def failure_summary(error, limit=2000):
+    """Return a bounded diagnostic without echoing the full prompt/command."""
+    if isinstance(error, subprocess.TimeoutExpired):
+        return f"hard deadline exceeded after {error.timeout}s"
+    text = str(error).strip()
+    return text if len(text) <= limit else text[:limit] + "... [truncated]"
+
+
+def run_codex(prompt):
+    """Return answer text via codex exec, reading the clean last message."""
+    with tempfile.NamedTemporaryFile(mode="r", suffix=".txt", delete=True) as out:
+        env = dict(os.environ)
+        cmd = ["codex", "exec", "--skip-git-repo-check"]
+        if CODEX_MODEL:
+            cmd.extend(["--model", CODEX_MODEL])
+        if CODEX_REASONING_EFFORT:
+            cmd.extend([
+                "--config",
+                f'model_reasoning_effort="{CODEX_REASONING_EFFORT}"',
+            ])
+        cmd.extend(["-o", out.name, prompt])
+        proc = subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL, capture_output=True, text=True,
+            timeout=(CODEX_TIMEOUT or None), env=env,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"codex exited {proc.returncode}:\n{proc.stderr or proc.stdout}")
+        out.seek(0)
+        answer = out.read().strip()
+    if not answer:
+        raise RuntimeError("codex returned no answer")
+    return answer
+
+
+def verdict_of(text):
+    """Return 'AGREE', 'DISAGREE', or None based on the trailing VERDICT line."""
+    for line in reversed(text.splitlines()):
+        s = line.strip().upper()
+        if s.startswith("VERDICT:"):
+            if "AGREE" in s and "DISAGREE" not in s:
+                return "AGREE"
+            if "DISAGREE" in s:
+                return "DISAGREE"
+    return None
+
+
+def strip_verdict(text):
+    lines = text.splitlines()
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if lines and lines[-1].strip().upper().startswith("VERDICT:"):
+        lines.pop()
+    return "\n".join(lines).strip()
+
+
+def fmt_dur(secs):
+    m, s = divmod(int(round(secs)), 60)
+    return f"{m}m {s:02d}s" if m else f"{s}s"
+
+
+def show(who, col, thinking, answer, quiet):
+    print(f"\n{col}{BOLD}━━ {who} ━━{RESET}")
+    if thinking and not quiet:
+        print(f"{DIM}{textwrap.indent(thinking, '  │ ')}{RESET}")
+    print(textwrap.indent(answer, "  "))
+    sys.stdout.flush()
+
+
+def main():
+    global CLAUDE_REPORT_DEADLINE, CLAUDE_RECOVERY_TIMEOUT, CODEX_TIMEOUT
+    ap = argparse.ArgumentParser(description="Claude <-> Codex debate to consensus.")
+    ap.add_argument("question", nargs="*", help="the question (or pipe via stdin)")
+    ap.add_argument("--max-rounds", type=int, default=6,
+                    help="max full rounds (Claude+Codex) before giving up (default 6)")
+    ap.add_argument("--quiet", action="store_true", help="hide Claude's thinking")
+    ap.add_argument("--think", type=int, default=42000, metavar="TOKENS",
+                    help="overall requested Claude thinking ceiling; each turn is "
+                         "capped by --claude-tranche-think (default 42000)")
+    ap.add_argument("--claude-tranche-think", type=int,
+                    default=CLAUDE_TRANCHE_THINK, metavar="TOKENS",
+                    help="max Claude extended-thinking tokens in one bounded "
+                         f"micro-report tranche (default {CLAUDE_TRANCHE_THINK})")
+    ap.add_argument("--save", metavar="FILE",
+                    help="write the full transcript to FILE "
+                         "(default: consensus_<timestamp>.md in the current directory)")
+    ap.add_argument("--no-save", action="store_true", help="do not write a transcript file")
+    ap.add_argument("--no-synthesize", action="store_true",
+                    help="on consensus, print the last turn verbatim instead of a synthesized answer")
+    ap.add_argument("--context", action="append", metavar="FILE", default=[],
+                    help="include FILE's contents in every turn's prompt (repeatable)")
+    ap.add_argument("--first", choices=("claude", "codex"), default="claude",
+                    help="which model takes the opening turn (default claude)")
+    ap.add_argument("--claude-timeout", "--claude-report-deadline",
+                    dest="claude_report_deadline", type=int,
+                    default=CLAUDE_REPORT_DEADLINE, metavar="SECS",
+                    help="durable-work checkpoint interval for Claude research "
+                         f"(default {CLAUDE_REPORT_DEADLINE}; five consecutive "
+                         "misses terminate the live process; "
+                         "--claude-timeout is retained as an alias)")
+    ap.add_argument("--claude-recovery-timeout", type=int,
+                    default=CLAUDE_RECOVERY_TIMEOUT, metavar="SECS",
+                    help="hard deadline for each no-thinking recovery report "
+                         f"(default {CLAUDE_RECOVERY_TIMEOUT})")
+    ap.add_argument("--codex-timeout", type=int, default=CODEX_TIMEOUT, metavar="SECS",
+                    help=f"per-turn timeout for Codex, 0 = no limit (default {CODEX_TIMEOUT})")
+    ap.add_argument("--progress", metavar="FILE",
+                    help="durable checkpoint log (default: the transcript path "
+                         "with .progress.md appended)")
+    args = ap.parse_args()
+
+    if args.claude_report_deadline <= 0:
+        ap.error("the Claude checkpoint interval must be positive")
+    if args.claude_recovery_timeout <= 0:
+        ap.error("the Claude recovery timeout must be positive")
+    CLAUDE_REPORT_DEADLINE = args.claude_report_deadline
+    CLAUDE_RECOVERY_TIMEOUT = args.claude_recovery_timeout
+    CODEX_TIMEOUT = args.codex_timeout
+
+    question = " ".join(args.question).strip() or (
+        sys.stdin.read().strip() if not sys.stdin.isatty() else "")
+    if not question:
+        ap.error("no question given (pass as argument or via stdin)")
+
+    run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if args.no_save:
+        save_path = None
+    else:
+        save_path = args.save or os.path.join(
+            os.getcwd(), f"consensus_{run_stamp}.md")
+    progress_path = args.progress or (
+        save_path + ".progress.md" if save_path else
+        os.path.join(os.getcwd(), f"consensus_{run_stamp}_progress.md")
+    )
+    claude_work_path = progress_path + ".claude-stream.jsonl"
+
+    context = ""
+    if args.context:
+        parts = []
+        for path in args.context:
+            with open(path) as fh:
+                parts.append(f"----- BEGIN {os.path.basename(path)} -----\n"
+                             f"{fh.read()}\n----- END {os.path.basename(path)} -----")
+        context = ("REFERENCE DOCUMENT(S) UNDER DISCUSSION (the question is about "
+                   "these — read carefully):\n\n" + "\n\n".join(parts) + "\n\n")
+
+    print(f"{SYS_COL}{BOLD}Question:{RESET} {question}")
+    if args.context:
+        print(f"{SYS_COL}Context: {', '.join(os.path.basename(p) for p in args.context)}{RESET}")
+    print(f"{SYS_COL}Claude and Codex will debate until they agree "
+          f"(max {args.max_rounds} rounds).{RESET}")
+    claude_label = f"{CLAUDE_MODEL or 'machine default'}/{CLAUDE_EFFORT or 'default effort'}"
+    codex_label = f"{CODEX_MODEL or 'machine default'}/{CODEX_REASONING_EFFORT or 'default effort'}"
+    print(f"{SYS_COL}Models: Claude {claude_label}; Codex {codex_label}.{RESET}")
+    print(f"{SYS_COL}Claude's durable stream journal is checked every "
+          f"{CLAUDE_REPORT_DEADLINE}s; terminate the live process after "
+          f"{CLAUDE_MAX_CONSECUTIVE_MISSES} consecutive silent intervals, then resume "
+          f"the session for recovery.{RESET}")
+    print(f"{SYS_COL}Progress: {progress_path}{RESET}")
+    print(f"{SYS_COL}Claude stream journal: {claude_work_path}{RESET}")
+
+    turns = []  # list of {"who","text","verdict"}
+    consensus = False
+
+    progress_parent = os.path.dirname(os.path.abspath(progress_path))
+    os.makedirs(progress_parent, exist_ok=True)
+    with open(progress_path, "w", encoding="utf-8") as progress:
+        progress.write(f"# Consensus progress — {datetime.now():%Y-%m-%d %H:%M}\n\n")
+        progress.write(f"Question: {question}\n\n")
+        progress.write(
+            f"Claude: {claude_label}; "
+            f"stream checkpoint interval: {CLAUDE_REPORT_DEADLINE}s; "
+            f"recovery deadline: {CLAUDE_RECOVERY_TIMEOUT}s; "
+            f"maximum consecutive misses: {CLAUDE_MAX_CONSECUTIVE_MISSES}\n\n"
+        )
+        progress.flush()
+        os.fsync(progress.fileno())
+    with open(claude_work_path, "w", encoding="utf-8") as work:
+        work.write(json.dumps({
+            "type": "consensus_stream_journal",
+            "created": datetime.now().isoformat(timespec="seconds"),
+            "note": "Runner-owned fsynced journal of Claude stream events",
+        }) + "\n")
+        work.flush()
+        os.fsync(work.fileno())
+
+    def append_progress(label, body):
+        with open(progress_path, "a", encoding="utf-8") as progress:
+            progress.write(f"## {datetime.now():%Y-%m-%d %H:%M:%S} — {label}\n\n")
+            progress.write(body.rstrip() + "\n\n")
+            progress.flush()
+            os.fsync(progress.fileno())
+
+    def claude_checkpoint_event(status, misses):
+        if status == "observed":
+            append_progress(
+                "Claude durable stream activity observed",
+                f"stream_journal: {claude_work_path}\nconsecutive_misses_reset: yes",
+            )
+        else:
+            append_progress(
+                f"Claude durable stream checkpoint missed {misses}/"
+                f"{CLAUDE_MAX_CONSECUTIVE_MISSES}",
+                f"interval: {CLAUDE_REPORT_DEADLINE}s\n"
+                f"stream_journal: {claude_work_path}",
+            )
+
+    def write_snapshot(outcome, final=None):
+        if not save_path:
+            return
+        tmp_path = save_path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            f.write(f"# Consensus debate — {datetime.now():%Y-%m-%d %H:%M}\n\n")
+            f.write(f"## Question\n{question}\n\n")
+            f.write(f"## Models\nClaude: {claude_label}; "
+                    f"Codex: {codex_label}\n\n")
+            f.write(f"## Outcome\n{outcome}\n\n")
+            if final:
+                f.write(f"## Agreed answer\n{final}\n\n")
+            for t in turns:
+                secs = t.get("secs")
+                tag = f", {fmt_dur(secs)}" if secs is not None else ""
+                f.write(f"## {t['who']}  (verdict: {t['verdict']}{tag})\n"
+                        f"{t['text']}\n\n")
+        os.replace(tmp_path, save_path)
+
+    current_round = 0
+    consecutive_claude_misses = 0
+    consecutive_no_progress = 0
+
+    def claude_turn():
+        nonlocal consecutive_claude_misses, consecutive_no_progress
+        p = build_prompt("Claude", "Codex", question, turns, opening=not turns,
+                         context=context)
+        t0 = time.perf_counter()
+        tranche_think = min(args.think, args.claude_tranche_think)
+        thinking = ""
+        answer = ""
+        recovery_prompt = p
+        session_id = str(uuid.uuid4())
+        append_progress(
+            "Claude research session started",
+            f"session_id: {session_id}\nstream_journal: {claude_work_path}",
+        )
+        p += f"""
+
+CLAUDE DURABILITY NOTICE:
+The runner continuously journals your streamed events to an fsynced file and
+retains this turn's resumable session ID. Do not modify project files merely to
+checkpoint the debate. Emit concise cumulative status text before any extended
+silent phase when possible, and return the required CHECKPOINT report. The
+runner permits five consecutive {CLAUDE_REPORT_DEADLINE}-second intervals
+without new streamed activity before it terminates the live process and
+resumes this same session.
+"""
+        recovery_prompt = p
+
+        while consecutive_claude_misses < CLAUDE_MAX_CONSECUTIVE_MISSES:
+            recovery = consecutive_claude_misses > 0
+            deadline = (
+                CLAUDE_RECOVERY_TIMEOUT if recovery
+                else None
+            )
+            think = 0 if recovery else tranche_think
+            if recovery:
+                recovery_prompt = p + f"""
+
+EXTERNAL RECOVERY TRANCHE:
+The preceding live research process reached its durability cutoff or failed to
+return a valid checkpoint report. This is recovery attempt
+{consecutive_claude_misses}/{CLAUDE_MAX_CONSECUTIVE_MISSES}. Do no new research,
+delegate no work, and invoke no tools. Recover from this resumed session, the
+debate transcript, and the durable stream journal; immediately return the required
+CHECKPOINT block and a concise cumulative report. End with VERDICT: DISAGREE.
+"""
+            try:
+                thinking, answer = run_claude(
+                    recovery_prompt,
+                    think,
+                    timeout=deadline,
+                    session_id=session_id,
+                    resume=recovery,
+                    checkpoint_file=(None if recovery else claude_work_path),
+                    checkpoint_event=(None if recovery else claude_checkpoint_event),
+                    stream_journal=claude_work_path,
+                )
+            except (subprocess.TimeoutExpired, RuntimeError) as error:
+                if isinstance(error, subprocess.TimeoutExpired) and not recovery:
+                    consecutive_claude_misses = 1
+                    append_progress(
+                        "Claude live process terminated after five silent intervals",
+                        f"interval: {CLAUDE_REPORT_DEADLINE}s\n"
+                        f"session_id: {session_id}\n"
+                        "action: resume same session for bounded recovery\n"
+                        f"reason: {failure_summary(error)}",
+                    )
+                else:
+                    consecutive_claude_misses += 1
+                    append_progress(
+                        f"Claude recovery/validity failure "
+                        f"{consecutive_claude_misses}/"
+                        f"{CLAUDE_MAX_CONSECUTIVE_MISSES}",
+                        f"deadline: {deadline or 'not applicable'}\n"
+                        f"session_id: {session_id}\n"
+                        f"reason: {failure_summary(error)}",
+                    )
+                if consecutive_claude_misses >= CLAUDE_MAX_CONSECUTIVE_MISSES:
+                    raise RuntimeError(
+                        f"Claude exhausted {CLAUDE_MAX_CONSECUTIVE_MISSES} "
+                        "consecutive recovery/validity "
+                        f"tranches; partial work is preserved in {progress_path}"
+                    )
+                continue
+
+            checkpoint = checkpoint_of(answer)
+            verdict = verdict_of(answer)
+            if checkpoint is None or verdict is None:
+                consecutive_claude_misses += 1
+                reason = (
+                    "missing or incomplete CHECKPOINT block"
+                    if checkpoint is None else "missing trailing VERDICT"
+                )
+                append_progress(
+                    f"Claude missed checkpoint {consecutive_claude_misses}/"
+                    f"{CLAUDE_MAX_CONSECUTIVE_MISSES}",
+                    f"deadline: {deadline}s\nreason: {reason}\n\n"
+                    f"Returned text:\n{answer}",
+                )
+                if consecutive_claude_misses >= CLAUDE_MAX_CONSECUTIVE_MISSES:
+                    raise RuntimeError(
+                        f"Claude returned {CLAUDE_MAX_CONSECUTIVE_MISSES} "
+                        "consecutive invalid checkpoint "
+                        f"reports; partial work is preserved in {progress_path}"
+                    )
+                continue
+
+            append_progress(
+                "Claude checkpoint",
+                f"wall_clock: {fmt_dur(time.perf_counter() - t0)}\n"
+                f"recovery: {'yes' if recovery else 'no'}\n\n{answer}",
+            )
+            consecutive_claude_misses = 0
+            if verdict == "DISAGREE" and no_substantive_progress(checkpoint):
+                consecutive_no_progress += 1
+            else:
+                consecutive_no_progress = 0
+            if consecutive_no_progress >= 2:
+                raise RuntimeError(
+                    "Claude returned two consecutive completed checkpoints "
+                    "with no substantive progress; partial work is preserved "
+                    f"in {progress_path}"
+                )
+            break
+
+        dur = time.perf_counter() - t0
+        turns.append({"who": "Claude", "text": answer,
+                      "verdict": verdict_of(answer), "secs": dur})
+        write_snapshot("IN PROGRESS")
+        show("Claude", CLAUDE_COL, thinking, answer, args.quiet)
+        print(f"{CLAUDE_COL}{DIM}  ⏱ Claude: {fmt_dur(dur)}{RESET}")
+
+    def codex_turn():
+        p = build_prompt("Codex", "Claude", question, turns, opening=not turns,
+                         context=context)
+        t0 = time.perf_counter()
+        answer = run_codex(p)
+        dur = time.perf_counter() - t0
+        turns.append({"who": "Codex", "text": answer,
+                      "verdict": verdict_of(answer), "secs": dur})
+        append_progress(
+            "Codex turn completed",
+            f"wall_clock: {fmt_dur(dur)}\nverdict: {verdict_of(answer)}",
+        )
+        write_snapshot("IN PROGRESS")
+        show("Codex", CODEX_COL, "", answer, args.quiet)
+        print(f"{CODEX_COL}{DIM}  ⏱ Codex: {fmt_dur(dur)}{RESET}")
+
+    order = (claude_turn, codex_turn) if args.first == "claude" else (codex_turn, claude_turn)
+
+    try:
+        for rnd in range(1, args.max_rounds + 1):
+            current_round = rnd
+            print(f"\n{SYS_COL}{DIM}round {rnd}/{args.max_rounds}{RESET}")
+            for step in order:
+                step()
+                if (len(turns) >= 2 and turns[-1]["verdict"] == "AGREE"
+                        and turns[-2]["verdict"] == "AGREE"):
+                    consensus = True
+                    break
+            if consensus:
+                break
+    except KeyboardInterrupt:
+        print(f"\n{SYS_COL}Interrupted.{RESET}")
+        append_progress("Run interrupted", "The user interrupted the debate.")
+        write_snapshot("INTERRUPTED")
+    except Exception as e:
+        print(f"\n{BOLD}\033[31mError:{RESET} {e}", file=sys.stderr)
+        append_progress("Run aborted", str(e))
+        write_snapshot(f"ABORTED: {e}")
+        sys.exit(1)
+
+    print()
+    final_answer = None
+    if consensus:
+        print(f"{BOLD}\033[32m✓ CONSENSUS REACHED{RESET} after {len(turns)} turns.\n")
+        if args.no_synthesize:
+            final_answer = strip_verdict(turns[-1]["text"])
+        else:
+            transcript = "\n\n".join(f"--- {t['who']} said ---\n{t['text']}" for t in turns)
+            try:
+                synth_started = time.perf_counter()
+                synth_session_id = str(uuid.uuid4())
+                append_progress(
+                    "Claude synthesis session started",
+                    f"session_id: {synth_session_id}\n"
+                    f"stream_journal: {claude_work_path}",
+                )
+                _, final_answer = run_claude(
+                    SYNTH.format(
+                        question=question, transcript=transcript, context=context,
+                        report_max_tokens=REPORT_MAX_TOKENS,
+                    ),
+                    min(args.think, args.claude_tranche_think),
+                    timeout=None,
+                    session_id=synth_session_id,
+                    checkpoint_file=claude_work_path,
+                    checkpoint_event=claude_checkpoint_event,
+                    stream_journal=claude_work_path,
+                )
+                append_progress(
+                    "Claude synthesis completed",
+                    f"wall_clock: {fmt_dur(time.perf_counter() - synth_started)}",
+                )
+            except Exception as e:
+                print(f"{SYS_COL}(synthesis step failed: {e}; showing last turn){RESET}")
+                append_progress(
+                    "Claude synthesis failed; durable agreed turn used",
+                    str(e),
+                )
+                final_answer = strip_verdict(turns[-1]["text"])
+        print(f"{BOLD}Agreed answer:{RESET}\n")
+        print(textwrap.indent(final_answer, "  "))
+    else:
+        print(f"{BOLD}\033[33m✗ No consensus{RESET} after {len(turns)} turns. "
+              f"Final positions:\n")
+        for who, col in (("Claude", CLAUDE_COL), ("Codex", CODEX_COL)):
+            last = next((t for t in reversed(turns) if t["who"] == who), None)
+            if last:
+                print(f"{col}{BOLD}{who}:{RESET}\n{textwrap.indent(strip_verdict(last['text']), '  ')}\n")
+
+    # --- timing summary ---
+    def total(who):
+        return sum(t.get("secs", 0.0) for t in turns if t["who"] == who)
+    c_tot, x_tot = total("Claude"), total("Codex")
+    n_c = sum(1 for t in turns if t["who"] == "Claude")
+    n_x = sum(1 for t in turns if t["who"] == "Codex")
+    print(f"\n{BOLD}Time spent (wall-clock):{RESET}")
+    print(f"  {CLAUDE_COL}Claude{RESET}: {fmt_dur(c_tot)} over {n_c} turn(s)"
+          f"{f' (avg {fmt_dur(c_tot / n_c)})' if n_c else ''}")
+    print(f"  {CODEX_COL}Codex{RESET} : {fmt_dur(x_tot)} over {n_x} turn(s)"
+          f"{f' (avg {fmt_dur(x_tot / n_x)})' if n_x else ''}")
+    print(f"  {SYS_COL}total debate: {fmt_dur(c_tot + x_tot)}{RESET}")
+
+    if save_path:
+        outcome = "CONSENSUS REACHED" if consensus else "NO CONSENSUS"
+        timing = (f"\n\nClaude: {fmt_dur(c_tot)} ({n_c} turns); "
+                  f"Codex: {fmt_dur(x_tot)} ({n_x} turns); "
+                  f"total: {fmt_dur(c_tot + x_tot)}")
+        write_snapshot(outcome + timing, final_answer)
+        print(f"\n{SYS_COL}Transcript saved to {save_path}{RESET}")
+    append_progress(
+        "Run completed",
+        ("CONSENSUS REACHED" if consensus else "NO CONSENSUS")
+        + f"\nClaude: {fmt_dur(c_tot)} ({n_c} turns)"
+        + f"\nCodex: {fmt_dur(x_tot)} ({n_x} turns)",
+    )
+    print(f"{SYS_COL}Progress saved to {progress_path}{RESET}")
+    print(f"{SYS_COL}Private Claude stream journal saved to "
+          f"{claude_work_path}{RESET}")
+
+
+if __name__ == "__main__":
+    main()
