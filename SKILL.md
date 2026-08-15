@@ -7,6 +7,10 @@ description: Use when an agent should consult both local Claude Code and Codex, 
 
 Use the bundled `scripts/consensus` runner to conduct a rigorous Claude–Codex exchange until two consecutive participants return `VERDICT: AGREE`, or the round limit is reached.
 
+This repository is the sole authoritative skill checkout. Both Codex and
+Claude must run this bundled runner; installed paths may only be symlinks into
+the repository. Never use or edit an independent deployed copy.
+
 ## Requirements
 
 - `claude` and `codex` must be installed, authenticated, and on `PATH`.
@@ -24,17 +28,25 @@ Every Claude research turn has a stable resumable session ID. The runner:
 3. checks that journal for new activity every five minutes by default;
 4. resets the silence count whenever new activity appears;
 5. terminates the live process only after five consecutive silent intervals;
-6. resumes the same Claude session for bounded no-thinking recovery;
-7. validates the six-field returned `CHECKPOINT` block and trailing verdict;
-8. atomically updates the Markdown debate transcript after each completed turn.
+6. independently caps every live research turn and synthesis at 15 minutes,
+   regardless of continuing stream activity;
+7. resumes the same Claude session for bounded no-thinking recovery;
+8. validates the six-field returned `CHECKPOINT` block and trailing verdict;
+9. atomically updates the Markdown debate transcript after each completed turn;
+10. terminates the complete child process group on interruption.
+
+Prompts and supplied context are delivered through stdin, not command-line
+arguments. The raw journal is created with mode `0600`. Verdicts are accepted
+only when the final nonempty line is exactly `VERDICT: AGREE` or
+`VERDICT: DISAGREE`.
 
 The required checkpoint fields are `elapsed`, `tentative_verdict`,
 `new_results`, `current_obstruction`, `next_bounded_step`, and
 `token_cost`. A missing field or verdict is an invalid returned report.
 
 The final synthesis has its own stable Claude session, uses the same durable
-stream journal and silence monitor, and falls back to the last agreed turn if
-synthesis fails.
+stream journal and silence monitor, and receives one bounded no-thinking
+same-session recovery attempt before falling back to the last agreed turn.
 
 ## Confidentiality boundary
 
@@ -85,11 +97,14 @@ material in a project file and return its path.
 
 - `--max-rounds N`: maximum full Claude+Codex rounds; default 6.
 - `--context FILE`: include a text file in every turn; repeatable.
-- `--think TOKENS`: requested Claude thinking ceiling; default 42000.
+- `--think TOKENS`: aggregate requested Claude thinking ceiling across fresh
+  research turns and synthesis; default 42000.
 - `--claude-tranche-think TOKENS`: per-call thinking cap; default 7000.
 - `--claude-report-deadline SECS`: stream-activity check interval; default 300.
   The older `--claude-timeout` spelling is an alias.
 - `--claude-recovery-timeout SECS`: no-thinking recovery deadline; default 120.
+- `--claude-turn-timeout SECS`: absolute live-turn and synthesis cap; default
+  900, and stream activity never resets it.
 - `--codex-timeout SECS`: Codex per-turn deadline; default 1200; zero is unlimited.
 - `--save FILE`: atomic Markdown transcript path.
 - `--progress FILE`: fsynced Markdown event log path.

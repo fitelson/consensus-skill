@@ -7,6 +7,14 @@ for structured Claude–Codex debates. Its central concern is durability: a long
 Claude turn should remain recoverable even when the live process becomes
 silent or crosses a monitoring boundary.
 
+## Authoritative checkout
+
+This repository is the single source of truth for the consensus skill. Codex
+and Claude must edit, test, and run this checkout only. The installed Codex
+skill path and any command on `PATH` must be symlinks into this checkout, not
+independently maintained copies. The former `consensus-portable` path is
+retired and must not be recreated.
+
 ## Architecture
 
 - `SKILL.md` defines when and how Codex should use the skill.
@@ -27,13 +35,21 @@ Preserve these properties in every release:
    conditions.
 5. Check stream activity every five minutes by default and stop only after five
    consecutive silent intervals.
-6. Recover by resuming the same Claude session with a bounded no-thinking call.
-7. Require the six checkpoint fields and a trailing `VERDICT` from completed
+6. Impose a 15-minute absolute cap on every live Claude research turn and
+   synthesis, regardless of stream activity.
+7. Recover by resuming the same Claude session with a bounded no-thinking call.
+8. Require the six checkpoint fields and a trailing `VERDICT` from completed
    Claude reports.
-8. Require two consecutive `VERDICT: AGREE` reports before synthesis.
-9. Cap returned participant reports at 40,000 tokens; put longer material in a
+9. Require two consecutive `VERDICT: AGREE` reports before synthesis, treating
+   agreement that a matter is unresolved as AGREE.
+10. Cap returned participant reports at 40,000 tokens; put longer material in a
    referenced project file.
-10. Treat raw `.claude-stream.jsonl` journals as private by default.
+11. Treat raw `.claude-stream.jsonl` journals as private by default.
+12. Terminate the complete active model process group on interruption.
+13. Deliver prompts through stdin and create raw journals with mode `0600`.
+14. Accept only exact final-line verdicts and preserve completed stalled turns.
+15. Make transcript and manifest replacement crash-durable with file and
+    directory fsyncs.
 
 Do not permit recursive consensus debates or participant model delegation.
 
@@ -64,7 +80,9 @@ Codex executables and must not consume model credits or require network access.
 
 ## Current status
 
-The initial public release includes stable-session recovery, runner-owned
-fsynced journaling, the five-silent-interval policy, synthesis fallback, and
-offline tests for ordinary agreement, silent recovery, activity-reset behavior,
-and journal creation.
+The current release includes stable-session recovery, runner-owned fsynced
+journaling, the five-silent-interval policy, a non-resettable 15-minute live
+turn cap, process-group cleanup on interruption, convergence semantics for
+unresolved verdicts, same-session synthesis recovery and fallback, private
+stdin prompt transport, strict verdict parsing, crash-durable artifacts, and
+offline regression coverage.
