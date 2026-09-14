@@ -2,7 +2,7 @@
 
 ## Purpose
 
-This repository maintains a model-neutral Codex skill and command-line runner
+This repository maintains a Codex skill and command-line runner
 for structured Claude–Codex debates. Its central concern is durability: a long
 Claude turn should remain recoverable even when the live process becomes
 silent or crosses a monitoring boundary.
@@ -27,8 +27,10 @@ retired and must not be recreated.
 
 Preserve these properties in every release:
 
-1. Use recipient-machine model defaults unless an optional `CONSENSUS_*`
-   environment variable explicitly overrides one.
+1. Resolve the latest documented reasoning flagships at debate startup and
+   explicitly run both at high effort. Freeze IDs for the exchange and record
+   provenance. Honor explicit per-run `CONSENSUS_*` overrides; never silently
+   fall back to machine defaults or older models when resolution fails.
 2. Give each Claude research turn and synthesis a stable, resumable session ID.
 3. Have the runner own and fsync the raw Claude stream journal.
 4. Treat stream activity and the validity of a returned checkpoint as separate
@@ -86,3 +88,8 @@ turn cap, process-group cleanup on interruption, convergence semantics for
 unresolved verdicts, same-session synthesis recovery and fallback, private
 stdin prompt transport, strict verdict parsing, crash-durable artifacts, and
 offline regression coverage.
+
+September 14, 2026: the maintainer replaced model neutrality with dynamic
+flagship selection and explicit high effort for both participants. Public model
+documentation is fetched without credentials or debate context. Offline tests
+use local documentation fixtures; no model calls are made to test the harness.

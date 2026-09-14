@@ -30,6 +30,8 @@ import textwrap
 import threading
 import time
 import uuid
+from pathlib import Path
+from urllib.request import Request, urlopen
 from datetime import datetime
 
 # ---- terminal colors --------------------------------------------------------
@@ -39,13 +41,90 @@ def _c(code):
 BOLD, DIM, RESET = _c("1"), _c("2"), _c("0")
 CLAUDE_COL, CODEX_COL, SYS_COL = _c("38;5;208"), _c("38;5;39"), _c("38;5;244")
 
-# Portable package: use the recipient machine's defaults unless these optional
-# environment variables are set.
+# Resolve current flagships once per run; pins are explicit per-run overrides.
 CLAUDE_MODEL = os.environ.get("CONSENSUS_CLAUDE_MODEL")
-CLAUDE_EFFORT = os.environ.get("CONSENSUS_CLAUDE_EFFORT")
+CLAUDE_EFFORT = os.environ.get("CONSENSUS_CLAUDE_EFFORT") or "high"
 CODEX_MODEL = os.environ.get("CONSENSUS_CODEX_MODEL")
-CODEX_REASONING_EFFORT = os.environ.get("CONSENSUS_CODEX_REASONING_EFFORT")
+CODEX_REASONING_EFFORT = os.environ.get("CONSENSUS_CODEX_REASONING_EFFORT") or "high"
+MODEL_DOCS = {
+    "openai": "https://developers.openai.com/api/docs/guides/latest-model.md",
+    "claude": "https://platform.claude.com/docs/en/about-claude/models/overview.md",
+}
 REPORT_MAX_TOKENS = 40000
+
+
+def read_model_doc(provider):
+    """Read public metadata only; never transmit debate context or credentials."""
+    directory = os.environ.get("CONSENSUS_MODEL_DOCS_DIR")
+    if directory:
+        path = Path(directory) / (provider + ".md")
+        return path.read_text(encoding="utf-8"), str(path.resolve())
+    url = MODEL_DOCS[provider]
+    request = Request(url, headers={"Accept": "text/markdown,text/plain",
+                                   "User-Agent": "consensus-skill"})
+    with urlopen(request, timeout=20) as response:
+        data = response.read(3_000_001)
+    if len(data) > 3_000_000:
+        raise ValueError(f"{provider} model document exceeds size limit")
+    return data.decode("utf-8"), url
+
+
+def parse_openai_model(document):
+    # Official latest-model metadata, not a guess from version numbers or links
+    # to historical models mentioned in the guide.
+    block = re.search(r"(?m)^latestModelInfo:\s*\n((?:[ \t]+[^\n]*\n?)+)",
+                      document)
+    model = re.search(r"(?m)^\s+model:\s*['\"]?(gpt-[a-z0-9.-]+)['\"]?\s*$",
+                      block[1]) if block else None
+    if not model:
+        raise ValueError("OpenAI latestModelInfo.model is missing or invalid")
+    return model[1]
+
+
+def parse_claude_model(document):
+    # The current comparison table identifies the demanding-reasoning flagship.
+    # Require an unambiguous description rather than taking the newest dated
+    # model (which could be Haiku), the account default, or a gateway alias.
+    section = re.search(r"(?ms)^## Compare models\s*\n(.*?)(?=^## |\Z)", document)
+    if not section:
+        raise ValueError("Claude Compare models section is missing")
+    rows = {}
+    for line in section[1].splitlines():
+        if line.startswith("|"):
+            cells = [c.strip() for c in line.strip().strip("|").split("|")]
+            if cells[0] in ("Description", "Claude API ID"):
+                if cells[0] in rows:
+                    raise ValueError("Ambiguous Claude model comparison tables")
+                rows[cells[0]] = cells[1:]
+    descriptions = rows.get("Description", [])
+    ids = rows.get("Claude API ID", [])
+    candidates = [i for i, text in enumerate(descriptions)
+                  if re.search(r"most (?:capable|intelligent)|demanding reasoning",
+                               text, re.I)]
+    if len(candidates) != 1 or len(descriptions) != len(ids):
+        raise ValueError("Claude flagship column is missing or ambiguous")
+    model = ids[candidates[0]].strip().strip(chr(96))
+    if not re.fullmatch(r"claude-[a-z0-9-]+", model):
+        raise ValueError("Claude flagship API ID is invalid")
+    return model
+
+
+def resolve_models():
+    """Freeze explicit model IDs and sources for this entire debate/recovery."""
+    selections = {}
+    for provider, pinned, parser, effort in (
+        ("openai", CODEX_MODEL, parse_openai_model, CODEX_REASONING_EFFORT),
+        ("claude", CLAUDE_MODEL, parse_claude_model, CLAUDE_EFFORT),
+    ):
+        if pinned:
+            model, source = pinned, "explicit CONSENSUS model override"
+        else:
+            document, source = read_model_doc(provider)
+            model = parser(document)
+        selections[provider] = {"model": model, "effort": effort, "source": source}
+    return {"resolved_at": datetime.now().isoformat(timespec="seconds"),
+            "selection_policy": "latest documented reasoning flagships; high effort",
+            "models": selections}
 
 CLAUDE_REPORT_DEADLINE = 300  # durable-work checkpoint interval
 CLAUDE_TRANCHE_THINK = 7000  # max extended-thinking tokens in one Claude tranche
@@ -426,6 +505,7 @@ def run_claude(prompt, think_budget, timeout=None, *, session_id=None,
         cmd.extend(["--model", CLAUDE_MODEL])
     if CLAUDE_EFFORT:
         cmd.extend(["--effort", CLAUDE_EFFORT])
+        env["CLAUDE_CODE_EFFORT_LEVEL"] = CLAUDE_EFFORT
     if session_id:
         cmd.extend(["--resume" if resume else "--session-id", session_id])
     returncode, stdout, stderr = _run_streaming(
@@ -596,11 +676,14 @@ def show(who, col, thinking, answer, quiet):
 def main():
     global CLAUDE_REPORT_DEADLINE, CLAUDE_RECOVERY_TIMEOUT
     global CLAUDE_TURN_TIMEOUT, CODEX_TIMEOUT
+    global CLAUDE_MODEL, CODEX_MODEL
     ap = argparse.ArgumentParser(description="Claude <-> Codex debate to consensus.")
     ap.add_argument("question", nargs="*", help="the question (or pipe via stdin)")
     ap.add_argument("--max-rounds", type=int, default=6,
                     help="max full rounds (Claude+Codex) before giving up (default 6)")
     ap.add_argument("--quiet", action="store_true", help="hide Claude's thinking")
+    ap.add_argument("--resolve-models", action="store_true",
+                    help="resolve current flagship IDs/efforts and print JSON; no model call")
     ap.add_argument("--think", type=int, default=42000, metavar="TOKENS",
                     help="aggregate requested Claude thinking ceiling across "
                          "fresh research turns and synthesis; each call is "
@@ -653,6 +736,17 @@ def main():
     CLAUDE_TURN_TIMEOUT = args.claude_turn_timeout
     CODEX_TIMEOUT = args.codex_timeout
 
+    try:
+        model_selection = resolve_models()
+    except (OSError, ValueError) as error:
+        ap.error(f"cannot resolve latest models: {error}. No debate started. "
+                 "Check official documentation or set explicit CONSENSUS model pins.")
+    CLAUDE_MODEL = model_selection["models"]["claude"]["model"]
+    CODEX_MODEL = model_selection["models"]["openai"]["model"]
+    if args.resolve_models:
+        print(json.dumps(model_selection, indent=2))
+        return
+
     question = " ".join(args.question).strip() or (
         sys.stdin.read().strip() if not sys.stdin.isatty() else "")
     if not question:
@@ -686,8 +780,8 @@ def main():
         print(f"{SYS_COL}Context: {', '.join(os.path.basename(p) for p in args.context)}{RESET}")
     print(f"{SYS_COL}Claude and Codex will debate until they agree "
           f"(max {args.max_rounds} rounds).{RESET}")
-    claude_label = f"{CLAUDE_MODEL or 'machine default'}/{CLAUDE_EFFORT or 'default effort'}"
-    codex_label = f"{CODEX_MODEL or 'machine default'}/{CODEX_REASONING_EFFORT or 'default effort'}"
+    claude_label = f"{CLAUDE_MODEL}/{CLAUDE_EFFORT}"
+    codex_label = f"{CODEX_MODEL}/{CODEX_REASONING_EFFORT}"
     print(f"{SYS_COL}Models: Claude {claude_label}; Codex {codex_label}.{RESET}")
     print(f"{SYS_COL}Claude's durable stream journal is checked every "
           f"{CLAUDE_REPORT_DEADLINE}s; terminate the live process after "
@@ -711,6 +805,7 @@ def main():
         runner_hash = hashlib.sha256(runner_file.read()).hexdigest()
     manifest = {
         "protocol_version": PROTOCOL_VERSION,
+        "model_selection": model_selection,
         "runner": runner_path,
         "runner_sha256": runner_hash,
         "claude_activity_interval_seconds": CLAUDE_REPORT_DEADLINE,
@@ -723,6 +818,7 @@ def main():
     with open(progress_path, "w", encoding="utf-8") as progress:
         progress.write(f"# Consensus progress — {datetime.now():%Y-%m-%d %H:%M}\n\n")
         progress.write(f"Question: {question}\n\n")
+        progress.write(f"Models: Claude {claude_label}; Codex {codex_label}.\n\n")
         progress.write(
             f"Claude: {claude_label}; "
             f"stream activity interval: {CLAUDE_REPORT_DEADLINE}s; "

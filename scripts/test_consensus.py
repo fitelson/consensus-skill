@@ -64,6 +64,7 @@ if call_log:
             "prompt_length": len(prompt),
             "thinking_tokens": os.environ.get("MAX_THINKING_TOKENS"),
             "thinking_disabled": os.environ.get("CLAUDE_CODE_DISABLE_THINKING") == "1",
+            "effort_env": os.environ.get("CLAUDE_CODE_EFFORT_LEVEL"),
         }) + "\n")
 
 if is_synthesis and mode == "synthesis_success":
@@ -229,6 +230,20 @@ def run_case(root, fake_bin, name, mode, extra_args=None, *, synthesize=False,
 def main():
     with tempfile.TemporaryDirectory(prefix="consensus-skill-test-") as tmp:
         root = Path(tmp)
+        docs = root / "model-docs"
+        docs.mkdir()
+        (docs / "openai.md").write_text(
+            "---\nlatestModelInfo:\n  model: gpt-99-flagship\n---\n"
+            "Old examples use gpt-6-astra.\n", encoding="utf-8")
+        (docs / "claude.md").write_text(
+            "## Compare models\n"
+            "| Feature | New flagship | Cheaper model |\n"
+            "| Description | For demanding reasoning and agentic work | Fast |\n"
+            "| Claude API ID | " + chr(96) + "claude-next-99" + chr(96)
+            + " | claude-haiku-100 |\n"
+            "## Legacy\nclaude-fable-5-1\n", encoding="utf-8")
+        # Every subprocess in this suite uses explicit offline doc fixtures.
+        os.environ["CONSENSUS_MODEL_DOCS_DIR"] = str(docs)
         fake_bin = root / "bin"
         fake_bin.mkdir()
         write_executable(fake_bin / "claude", textwrap.dedent(FAKE_CLAUDE))
@@ -237,12 +252,12 @@ def main():
         success, _, _ = run_case(root, fake_bin, "success", "success")
         assert "Run completed" in success
 
-        claude_log = root / "neutral-claude.jsonl"
-        codex_log = root / "neutral-codex.jsonl"
+        claude_log = root / "latest-claude.jsonl"
+        codex_log = root / "latest-codex.jsonl"
         run_case(
             root,
             fake_bin,
-            "model-neutrality",
+            "latest-high-defaults",
             "success",
             extra_env={
                 "FAKE_CLAUDE_CALL_LOG": str(claude_log),
@@ -251,9 +266,47 @@ def main():
         )
         neutral_claude_args = json.loads(claude_log.read_text().splitlines()[0])["argv"]
         neutral_codex_args = json.loads(codex_log.read_text().splitlines()[0])["argv"]
-        assert "--model" not in neutral_claude_args
-        assert "--effort" not in neutral_claude_args
-        assert "--model" not in neutral_codex_args
+        assert neutral_claude_args[neutral_claude_args.index("--model") + 1] == "claude-next-99"
+        assert neutral_claude_args[neutral_claude_args.index("--effort") + 1] == "high"
+        assert neutral_codex_args[neutral_codex_args.index("--model") + 1] == "gpt-99-flagship"
+        assert 'model_reasoning_effort="high"' in neutral_codex_args
+        assert json.loads(claude_log.read_text().splitlines()[0])["effort_env"] == "high"
+        protocol = json.loads((root / "latest-high-defaults.progress.md.protocol.json").read_text())
+        assert protocol["model_selection"]["models"]["openai"]["model"] == "gpt-99-flagship"
+
+        resolver_env = dict(os.environ)
+        for key in ("CONSENSUS_CLAUDE_MODEL", "CONSENSUS_CODEX_MODEL",
+                    "CONSENSUS_CLAUDE_EFFORT", "CONSENSUS_CODEX_REASONING_EFFORT"):
+            resolver_env.pop(key, None)
+        resolved = subprocess.run([str(RUNNER), "--resolve-models"],
+                                  env=resolver_env, capture_output=True, text=True, check=True)
+        assert json.loads(resolved.stdout)["models"]["claude"]["effort"] == "high"
+        # Malformed documentation must fail before either participant starts.
+        malformed = root / "malformed-docs"
+        malformed.mkdir()
+        (malformed / "openai.md").write_text("Historical mention: gpt-5.5\n")
+        resolver_env["CONSENSUS_MODEL_DOCS_DIR"] = str(malformed)
+        failed = subprocess.run([str(RUNNER), "--resolve-models"],
+                                env=resolver_env, capture_output=True, text=True)
+        assert failed.returncode == 2 and "No debate started" in failed.stderr
+        # Explicit pins work without readable current documentation.
+        resolver_env.update(CONSENSUS_CODEX_MODEL="pinned-openai",
+                            CONSENSUS_CLAUDE_MODEL="pinned-claude")
+        pinned = subprocess.run([str(RUNNER), "--resolve-models"],
+                                env=resolver_env, capture_output=True, text=True, check=True)
+        assert json.loads(pinned.stdout)["models"]["claude"]["model"] == "pinned-claude"
+        symbols = runpy.run_path(str(RUNNER))
+        for bad in (
+            "## Compare models\n| Description | Fast |\n| Claude API ID | claude-cheap |\n",
+            "## Compare models\n| Description | Most capable | Demanding reasoning |\n"
+            "| Claude API ID | claude-one | claude-two |\n",
+        ):
+            try:
+                symbols["parse_claude_model"](bad)
+            except ValueError:
+                pass
+            else:
+                raise AssertionError("ambiguous/nonflagship Claude table was accepted")
 
         claude_log = root / "override-claude.jsonl"
         codex_log = root / "override-codex.jsonl"

@@ -17,7 +17,8 @@ network access or model charges.
 
 For every behavioral change:
 
-- preserve model neutrality, stable session IDs, runner-owned fsynced
+- preserve dynamic flagship selection and explicit high effort by default,
+  stable session IDs, runner-owned fsynced
   journaling, five-interval silence handling, the absolute live-turn cap, and
   same-session recovery;
 - keep stream activity distinct from returned-checkpoint validity;

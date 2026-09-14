@@ -13,7 +13,8 @@ behavioral contract.
 
 When changing the runner:
 
-- preserve model neutrality and stable Claude session recovery;
+- preserve dynamic flagship selection, explicit high effort by default, and
+  stable Claude session recovery;
 - keep the raw stream journal runner-owned, fsynced, and private by default;
 - add or update an offline regression test for behavioral changes;
 - do not use live Claude or Codex calls merely to test the harness;

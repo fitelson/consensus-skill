@@ -5,15 +5,19 @@ decisions, paper reviews, and arguments. The runner preserves long Claude work
 in resumable sessions, requires explicit convergence, and produces a durable
 Markdown transcript.
 
-The skill is model-neutral: it uses the recipient machine's authenticated
-Claude and Codex defaults unless optional `CONSENSUS_*` environment variables
-override them.
+At each debate startup the runner resolves the latest documented OpenAI
+reasoning flagship and Claude demanding-reasoning flagship, and explicitly
+runs both at **high** effort. The selected IDs remain fixed for the entire
+exchange, including synthesis, and are recorded with source URLs and a timestamp.
+Machine model/effort defaults are not used. Explicit per-run pins remain supported.
 
 ## Requirements
 
 - macOS or another POSIX system with Python 3.8 or later;
 - authenticated `claude` and `codex` commands on `PATH`;
 - Git for installation and updates.
+- Network access to the public OpenAI and Anthropic model documentation for
+  dynamic selection, unless both models are explicitly pinned.
 
 Participants may use ordinary tools, but the debate prompt forbids recursive
 consensus runs, model delegation, and delegating the participant's debate role
@@ -107,6 +111,8 @@ consensus --quiet \
 
 Run `consensus --help` for the complete CLI reference. Important options are:
 
+- `--resolve-models`: print model IDs, efforts, and provenance as JSON without
+  starting a debate or consuming model usage;
 - `--quiet`: hide streamed Claude thinking while retaining returned reports;
 - `--save FILE`: write the atomic Markdown transcript to `FILE`;
 - `--progress FILE`: write the fsynced human-readable event log to `FILE`;
@@ -196,7 +202,26 @@ the transcript and auxiliary artifacts before sharing them.
 - `CONSENSUS_CODEX_MODEL`
 - `CONSENSUS_CODEX_REASONING_EFFORT`
 
-When unset, the installed CLI defaults are used.
+When unset, models are resolved from current official documentation and both
+efforts are explicitly `high`. Set these overrides only for an intentional
+alternative, not to reproduce an unrelated local default. No global settings
+are modified.
+
+Model discovery reads OpenAI's `latestModelInfo.model` from
+[the latest-model guide](https://developers.openai.com/api/docs/guides/latest-model.md)
+and the unique most-capable/demanding-reasoning column of Anthropic's
+[current model comparison table](https://platform.claude.com/docs/en/about-claude/models/overview.md).
+It does not rank every mentioned version number or pick a cheaper model because
+its release is newer. If documentation is unreachable, malformed, or ambiguous,
+the run stops before either CLI starts. There is no silent stale-cache fallback.
+Account/gateway availability is still enforced by the CLIs; a rejection is not
+permission to downgrade. Third-party provider IDs may need explicit pins.
+
+For offline tests or an intentionally supplied documentation snapshot,
+`CONSENSUS_MODEL_DOCS_DIR` may point to a directory containing `openai.md` and
+`claude.md`. This is an explicit source override, not an automatic cache. The
+local source paths are recorded in place of URLs. The test suite uses fixtures
+with future model IDs to check that releases are not hard-coded.
 
 ## Development and release verification
 

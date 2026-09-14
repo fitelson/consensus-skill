@@ -93,12 +93,24 @@ both model CLIs through stdin, avoiding command-line disclosure and operating
 system argument-size limits. Persisted model-failure diagnostics contain exit
 status and protocol metadata, not raw prompt-bearing stdout or stderr.
 
-## Model neutrality
+## Model resolution and effort
 
-The runner does not pass `--model` or effort flags unless the optional
-`CONSENSUS_*` environment variables are present. This lets the recipient's
-authenticated Claude and Codex installations select their own supported
-defaults.
+The runner resolves explicit flagship IDs once per debate from public official
+documentation and uses high effort for both CLIs. OpenAI selection uses the
+latest-model guide's structured metadata; Claude selection uses the unique
+most-capable/demanding-reasoning description column in the current comparison
+table and its Claude API ID. No prompts, credentials, or private context are
+sent to documentation endpoints. Fetches have a 20-second timeout and size cap.
+
+Ambiguous or unavailable documentation stops the run before model calls.
+Explicit `CONSENSUS_*` pins override discovery/effort independently. A local
+`CONSENSUS_MODEL_DOCS_DIR` is supported for explicit snapshots and offline tests;
+its paths are recorded as sources, so it cannot masquerade as live discovery.
+`--resolve-models` prints the selection without running participants. The
+protocol manifest records model IDs, efforts, sources, and resolution time.
+Claude receives both `--effort` and a matching `CLAUDE_CODE_EFFORT_LEVEL` in its
+child environment; Codex receives its reasoning-effort config override.
+CLI rejection of a model is surfaced, not retried with an older model.
 
 The `--think` budget is aggregate across fresh Claude research turns and the
 initial synthesis call. Each call is separately capped by
@@ -119,7 +131,8 @@ The bundled offline tests cover:
 - normal stalled termination retaining both completed turns;
 - synthesis success, same-session recovery, and agreed-turn fallback;
 - private journal permissions and prompts larger than the command-line limit;
-- recipient defaults and explicit model overrides;
+- dynamic flagship selection, explicit high defaults, pins, provenance, and
+  fail-closed handling of missing/ambiguous model documentation;
 - valid JSONL journaling;
 - atomic transcript/progress/manifest creation.
 

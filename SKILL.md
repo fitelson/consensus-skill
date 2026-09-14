@@ -1,6 +1,6 @@
 ---
 name: consensus
-description: Use when an agent should consult both local Claude Code and Codex, or run a structured Claude-vs-Codex debate about a difficult proof, document, design decision, paper review, or argument. Trigger on requests such as "ask Claude", "use consensus", "have Claude and Codex debate", "get a debated second opinion", or "audit this with both models". Uses recipient-machine model defaults unless optional environment overrides are set.
+description: Use when an agent should consult both local Claude Code and Codex, or run a structured Claude-vs-Codex debate about a difficult proof, document, design decision, paper review, or argument. Trigger on requests such as "ask Claude", "use consensus", "have Claude and Codex debate", "get a debated second opinion", or "audit this with both models". Resolves the latest documented reasoning flagships and runs both at high effort.
 ---
 
 # Consensus Debate
@@ -14,10 +14,20 @@ the repository. Never use or edit an independent deployed copy.
 ## Requirements
 
 - `claude` and `codex` must be installed, authenticated, and on `PATH`.
-- The runner intentionally uses each recipient machine's model and effort defaults.
-- Optional overrides are environment variables, not hard-coded skill policy:
+- Before every debate, the runner resolves the current OpenAI flagship from official
+  latest-model metadata and the current Claude demanding-reasoning flagship from
+  Anthropic's comparison table. It passes explicit model IDs to both CLIs and
+  explicitly sets both efforts to `high`, including synthesis and recovery calls
+  (recovery still disables thinking as part of the durability protocol).
+- Do not raise effort to max/xhigh or inherit machine defaults for a normal debate.
+  Use overrides only when the user explicitly requests a different model or effort:
   `CONSENSUS_CLAUDE_MODEL`, `CONSENSUS_CLAUDE_EFFORT`,
   `CONSENSUS_CODEX_MODEL`, and `CONSENSUS_CODEX_REASONING_EFFORT`.
+- `--resolve-models` prints the resolved IDs, efforts, sources, and timestamp
+  without a model call. Resolution failure stops before any participant starts;
+  do not silently substitute a cached, older, cheaper, or account-default model.
+  Documented availability is not proof of account/gateway access: surface a CLI
+  rejection instead of downgrading. Provider-specific IDs require an explicit pin.
 
 ## Mandatory durability protocol
 
@@ -73,6 +83,8 @@ material in a project file and return its path.
    desired final format.
 4. Run the bundled script with `--quiet`, explicit `--save` and
    `--progress` paths, and repeated `--context` flags.
+   Check the model/effort selection printed at startup. It is frozen for the
+   entire exchange and saved in the protocol manifest.
 5. Monitor the Markdown progress log and private JSONL stream journal.
 6. Read the saved transcript. Report consensus if reached; otherwise report the
    unresolved split and both final positions.
