@@ -5,6 +5,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import signal
 import stat
 import subprocess
 import sys
@@ -118,6 +119,16 @@ elif mode == "interrupt" and not recovery:
     if child_pid_file:
         with open(child_pid_file, "w", encoding="utf-8") as handle:
             handle.write(str(child.pid))
+    while True:
+        print(json.dumps({"type": "system", "subtype": "status"}), flush=True)
+        time.sleep(0.1)
+elif mode == "die_on_term" and not recovery:
+    # Like a real CLI hit by a supervisor's process-tree SIGTERM: exit at once.
+    import signal
+    signal.signal(signal.SIGTERM, lambda *_: os._exit(143))
+    ready_file = os.environ.get("FAKE_CLAUDE_READY_FILE")
+    if ready_file:
+        open(ready_file, "w", encoding="utf-8").close()
     while True:
         print(json.dumps({"type": "system", "subtype": "status"}), flush=True)
         time.sleep(0.1)
@@ -691,6 +702,49 @@ def main():
         assert "INTERRUPTED" in save.read_text(encoding="utf-8")
         assert_process_gone(model_pid)
         assert_process_gone(child_pid)
+
+        # Regression: a supervisor stopping the job signals the whole process
+        # tree, so the provider can die before the runner sees its own SIGTERM.
+        # The runner must not answer that death with a recovery call, which
+        # would start after the supervisor enumerated the tree and be orphaned.
+        save = root / "tree-kill.md"
+        progress = root / "tree-kill.progress.md"
+        pid_file = root / "tree-kill-model.pid"
+        ready_file = root / "tree-kill-model.ready"
+        call_log = root / "tree-kill-calls.jsonl"
+        env = dict(os.environ)
+        env["PATH"] = str(fake_bin) + os.pathsep + env.get("PATH", "")
+        env["FAKE_CLAUDE_MODE"] = "die_on_term"
+        env["FAKE_CLAUDE_PID_FILE"] = str(pid_file)
+        env["FAKE_CLAUDE_READY_FILE"] = str(ready_file)
+        env["FAKE_CLAUDE_CALL_LOG"] = str(call_log)
+        command = [
+            str(RUNNER), "--quiet", "--max-rounds", "1", "--no-synthesize",
+            "--claude-turn-timeout", "30", "--claude-recovery-timeout", "30",
+            "--save", str(save), "--progress", str(progress), "process-tree stop",
+        ]
+        running = subprocess.Popen(
+            command, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(100):
+            if ready_file.exists() or running.poll() is not None:
+                break
+            time.sleep(0.05)
+        assert ready_file.exists(), "fake Claude never became ready"
+        model_pid = int(pid_file.read_text(encoding="utf-8"))
+        os.kill(model_pid, signal.SIGTERM)  # provider first, as in a tree kill
+        time.sleep(0.3)  # runner's copy of the signal arrives a little later
+        running.terminate()
+        stdout, stderr = running.communicate(timeout=15)
+        assert running.returncode == 130, (stdout, stderr)
+        tree_progress = progress.read_text(encoding="utf-8")
+        assert "invalid report" not in tree_progress, tree_progress
+        assert "recovery: yes" not in tree_progress, tree_progress
+        calls = [json.loads(line) for line in call_log.read_text().splitlines() if line]
+        assert len(calls) == 1 and not calls[0]["recovery"], calls
+        assert "INTERRUPTED" in save.read_text(encoding="utf-8")
+        assert_process_gone(model_pid)
 
     for helper in ("test_hardening.py", "test_lifecycle.py"):
         subprocess.run([sys.executable, str(Path(__file__).with_name(helper)), "-q"], check=True)

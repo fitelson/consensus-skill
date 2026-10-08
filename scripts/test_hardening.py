@@ -16,10 +16,12 @@ import io
 import json
 import os
 from pathlib import Path
+import signal
 import stat
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -1044,6 +1046,81 @@ class CheckpointMonitorTests(RunnerCase):
         clock[0] = 1800.0
         with self.assertRaisesRegex(RuntimeError, "checkpoint|semantic"):
             monitor.tick()
+
+
+class ShutdownLatchTests(RunnerCase):
+    """Termination signals latch a stop; they never raise asynchronously."""
+
+    def setUp(self):
+        super().setUp()
+        self.helper("shutdown_requested")
+        state = self.runner._SHUTDOWN
+        saved = dict(state)
+        handlers = {s: signal.getsignal(s) for s in self.runner.TERMINATION_SIGNALS}
+
+        def restore():
+            state.clear()
+            state.update(saved)
+            for s, handler in handlers.items():
+                signal.signal(s, handler)
+        self.addCleanup(restore)
+        state.update({"requested": False, "signal": None})
+
+    def test_installed_handler_latches_without_raising(self):
+        self.helper("install_shutdown_handlers")()
+        os.kill(os.getpid(), signal.SIGTERM)
+        time.sleep(0.05)  # the handler runs at the next bytecode boundary
+        self.assertTrue(self.runner.shutdown_requested())
+        self.assertEqual(self.runner._SHUTDOWN["signal"], signal.SIGTERM)
+        with self.assertRaises(KeyboardInterrupt) as raised:
+            self.runner.check_shutdown()
+        self.assertIsInstance(raised.exception, self.runner.ShutdownRequested)
+
+    def test_signal_during_deferred_cleanup_is_latched_not_dropped(self):
+        calls = []
+
+        def original(*_):
+            calls.append("original")
+        signal.signal(signal.SIGTERM, original)
+        with self.helper("deferred_interrupts")():
+            os.kill(os.getpid(), signal.SIGTERM)
+            time.sleep(0.05)
+        self.assertEqual(calls, [], "cleanup must not run the interrupting handler")
+        self.assertTrue(self.runner.shutdown_requested())
+        self.assertIs(signal.getsignal(signal.SIGTERM), original)
+
+    def test_streaming_refuses_to_spawn_after_stop(self):
+        # setUp turns any Popen into an AssertionError, so reaching it fails.
+        self.runner._latch_shutdown(signal.SIGTERM)
+        with self.assertRaises(self.runner.ShutdownRequested):
+            self.runner._run_streaming(["claude", "-p"], {}, 5)
+
+    def test_signaled_provider_exit_codes_are_classified(self):
+        exit_error = self.helper("provider_exit_error")
+        signaled = self.runner.ProviderSignaled
+        for code in (-signal.SIGTERM, -signal.SIGKILL, 128 + signal.SIGTERM,
+                     128 + signal.SIGINT, 128 + signal.SIGHUP):
+            self.assertIsInstance(exit_error("claude", code), signaled, code)
+        for code in (1, 2, 3, 127):
+            error = exit_error("codex", code)
+            self.assertIsInstance(error, RuntimeError)
+            self.assertNotIsInstance(error, signaled, code)
+            self.assertIn("codex exited with status", str(error))
+
+    def test_termination_pending_waits_briefly_only_for_signaled_providers(self):
+        pending = self.helper("termination_pending")
+        with mock.patch.object(self.runner, "PROVIDER_SIGNAL_GRACE", 0.1):
+            started = time.monotonic()
+            self.assertFalse(pending(RuntimeError("claude exited with status 1")))
+            self.assertLess(time.monotonic() - started, 0.05)
+            self.assertFalse(pending(self.runner.ProviderSignaled("claude exited")))
+            self.assertGreaterEqual(time.monotonic() - started, 0.1)
+            # The runner's own signal arriving inside the grace window counts.
+            timer = threading.Timer(0.02, self.runner._latch_shutdown, (signal.SIGTERM,))
+            self.addCleanup(timer.cancel)
+            timer.start()
+            self.assertTrue(pending(self.runner.ProviderSignaled("claude exited")))
+            self.assertTrue(pending(ValueError("invalid report")))
 
 
 if __name__ == "__main__":

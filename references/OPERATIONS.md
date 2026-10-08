@@ -206,6 +206,23 @@ synthesis paths must remain within bounded waits and owned cleanup. Repeated
 cancellation must not interrupt process-group escalation and reaping. Do not
 claim successful cleanup until the owned processes have been reaped.
 
+During a debate, SIGINT, SIGTERM, and SIGHUP only latch a stop request. The
+runner acts on it at safe polling points: at most about 50 ms while streaming,
+and before every provider spawn. Handlers never raise asynchronously, because
+an exception landing inside queue or lock internals can surface as an unrelated
+`RuntimeError` and be misread as an invalid report. Signals that arrive during
+cleanup are latched rather than dropped.
+
+Once a stop is latched, the runner starts no new provider call. That includes
+same-session recovery and synthesis recovery. A supervisor that stops the job
+usually signals the whole process tree, so the provider may die before the
+runner sees its own signal. A provider that exits by signal (a negative status
+or 128+INT/TERM/HUP) therefore gets a one-second grace for the runner's stop to
+arrive before its failure counts as an invalid report. While stopping, owned
+groups get SIGKILL two seconds after SIGTERM instead of five. This keeps cleanup
+inside a supervisor's own escalation window. Interrupted runs exit 130 with an
+`INTERRUPTED` transcript.
+
 Provider calls retain only bounded report/control data in memory (2,000,000
 bytes), not the entire incoming stream. Input images, tool results, partial
 messages, signatures, and stderr stay in the private disk journal. Each JSON

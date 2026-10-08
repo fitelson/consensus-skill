@@ -160,3 +160,22 @@ that aborted stream had no final report, so replay verifies transport, not the
 research verdict. The expanded release gate includes 27 orchestrated cases,
 88 hardening tests, and 15 lifecycle tests, all passed. Syntax, skill metadata,
 local documentation links, and whitespace checks also passed.
+
+October 8, 2026 stop-signal fix. Stopping a live debate as a background job
+twice left an orphaned `claude -p --resume` recovery call. Both progress logs
+show `invalid report 1/2 — reason: release unlocked lock` followed by
+`recovery: yes`. The cause was the SIGTERM handler raising `KeyboardInterrupt`
+asynchronously inside `queue.get()` lock handling. That produced a
+`RuntimeError`, which the turn loop treated as an invalid report. The tree-kill
+ordering (provider dies first) and the old cleanup deferral, which dropped
+signals, caused the same misreading.
+
+Termination signals now latch a stop that is polled at safe points. Spawns and
+recoveries are refused once stopping. Signaled provider exits wait briefly for
+the runner's own stop. New regressions:
+- an orchestrated tree-kill case (`die_on_term` fake provider);
+- five `ShutdownLatchTests` in the hardening suite.
+
+Against the pre-fix runner the tree-kill case reproduces the incident: one
+recovery call, an `invalid report` entry, and exit 0. With the fix it exits
+130 after a single provider call.

@@ -308,6 +308,68 @@ class StreamLimitExceeded(RuntimeError):
     pass
 
 
+class ShutdownRequested(KeyboardInterrupt):
+    """A latched termination signal, raised only at a safe polling point."""
+
+
+class ProviderSignaled(RuntimeError):
+    """A provider process died from a termination signal."""
+
+
+# Termination signals only latch this flag. Raising asynchronously from a
+# handler can land inside queue/threading lock internals and surface as an
+# unrelated RuntimeError ("release unlocked lock"), which the turn loop would
+# misread as an invalid report and answer with a fresh recovery call.
+_SHUTDOWN = {"requested": False, "signal": None}
+TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
+SIGNALED_EXIT_CODES = {128 + int(s) for s in TERMINATION_SIGNALS}
+PROVIDER_SIGNAL_GRACE = 1.0  # wait for our own copy of a process-tree signal
+SHUTDOWN_TERM_GRACE = 2.0  # SIGTERM-to-SIGKILL escalation once stopping
+
+
+def _latch_shutdown(signum, _frame=None):
+    if _SHUTDOWN["signal"] is None:
+        _SHUTDOWN["signal"] = signum
+    _SHUTDOWN["requested"] = True
+
+
+def install_shutdown_handlers():
+    for s in TERMINATION_SIGNALS:
+        signal.signal(s, _latch_shutdown)
+
+
+def shutdown_requested(wait=0.0):
+    """Report the latch, optionally polling briefly for a pending signal."""
+    deadline = time.monotonic() + wait
+    while not _SHUTDOWN["requested"] and time.monotonic() < deadline:
+        time.sleep(0.02)
+    return _SHUTDOWN["requested"]
+
+
+def check_shutdown():
+    if _SHUTDOWN["requested"]:
+        raise ShutdownRequested("termination requested")
+
+
+def termination_pending(error):
+    """Whether a provider failure belongs to a run that is being stopped.
+
+    A process-tree kill (e.g. a supervisor stopping the job) signals the
+    provider and the runner at nearly the same moment. If the provider's death
+    is observed first, give the runner's own signal a moment to arrive rather
+    than starting a recovery call that would outlive the stop.
+    """
+    if shutdown_requested():
+        return True
+    return isinstance(error, ProviderSignaled) and shutdown_requested(PROVIDER_SIGNAL_GRACE)
+
+
+def provider_exit_error(provider, code):
+    if code < 0 or code in SIGNALED_EXIT_CODES:
+        return ProviderSignaled(f"{provider} exited with status {code} (signal)")
+    return RuntimeError(f"{provider} exited with status {code}")
+
+
 class CheckpointMonitor:
     """Semantic deadlines accumulate only while this participant is active."""
     def __init__(self, interval=900, on_miss=None):
@@ -350,10 +412,12 @@ def deferred_interrupts():
     if threading.current_thread() is not threading.main_thread():
         yield
         return
-    handlers = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)}
+    handlers = {s: signal.getsignal(s) for s in TERMINATION_SIGNALS}
     try:
         for s in handlers:
-            signal.signal(s, lambda *_: None)
+            # Latch rather than drop: a stop requested during cleanup must
+            # still prevent any later provider call.
+            signal.signal(s, _latch_shutdown)
         yield
     finally:
         for s, handler in handlers.items():
@@ -381,7 +445,9 @@ def _terminate_group(proc, pgid):
         os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         pass
-    deadline = time.monotonic() + 5
+    # Once stopping, escalate sooner so cleanup finishes inside a supervisor's
+    # own SIGTERM-to-SIGKILL window.
+    deadline = time.monotonic() + (SHUTDOWN_TERM_GRACE if shutdown_requested() else 5)
     proc.poll()
     while _group_alive(pgid) and time.monotonic() < deadline:
         proc.poll()
@@ -543,6 +609,7 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
             semantic_monitor.tick(started)
         if stream_journal:
             journal = private_open(stream_journal)
+        check_shutdown()  # never start a provider call after a stop request
         proc = subprocess.Popen(
             cmd, env=env, stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0, start_new_session=True,
@@ -568,6 +635,7 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
             thread.start()
             threads.append(thread)
         while proc.poll() is None or len(closed) < 2 or not events.empty():
+            check_shutdown()
             now = time.monotonic()
             if semantic_monitor:
                 semantic_monitor.tick(now)
@@ -831,7 +899,7 @@ def run_claude(prompt, think_budget, timeout=None, *, session_id=None,
         capture_output=False,
     )
     if code:
-        raise RuntimeError(f"claude exited with status {code}")
+        raise provider_exit_error("claude", code)
     return claude_answer(stdout or observer.collected_stdout())
 
 
@@ -901,7 +969,7 @@ def run_codex(prompt, *, session=None, timeout=None, stream_journal=None,
             capture_output=False,
         )
         if code:
-            raise RuntimeError(f"codex exited with status {code}")
+            raise provider_exit_error("codex", code)
         stdout = stdout or observer.collected_stdout()
         completed = False
         for line in stdout.splitlines():
@@ -1309,6 +1377,10 @@ def main():
                 monitor.observe(cp)
                 break
             except (RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
+                if termination_pending(error):
+                    # A stopped run must not answer the failure with a recovery
+                    # call that would outlive the stop.
+                    raise ShutdownRequested("termination requested") from None
                 if monitor.misses >= 2:
                     raise RuntimeError(who + " missed two consecutive semantic checkpoint deadlines")
                 append_progress(who + f" invalid report {attempt + 1}/2",
@@ -1338,11 +1410,9 @@ def main():
 
     order = (claude_turn, codex_turn) if args.first == "claude" else (codex_turn, claude_turn)
 
-    def interrupt_signal(_signum, _frame):
-        raise KeyboardInterrupt
-
-    for interruptible in (signal.SIGTERM, signal.SIGHUP):
-        signal.signal(interruptible, interrupt_signal)
+    # Signals latch a stop that is acted on at safe polling points (at most
+    # ~50 ms while streaming); see _SHUTDOWN.
+    install_shutdown_handlers()
 
     interrupted = False
     try:
@@ -1430,6 +1500,14 @@ def main():
                 print(f"\n{SYS_COL}Interrupted during synthesis.{RESET}")
                 return 130
             except Exception as e:
+                if termination_pending(e):
+                    append_progress(
+                        "Run interrupted during synthesis",
+                        "The active model process group was terminated.",
+                    )
+                    write_snapshot("INTERRUPTED DURING SYNTHESIS")
+                    print(f"\n{SYS_COL}Interrupted during synthesis.{RESET}")
+                    return 130
                 append_progress(
                     "Claude synthesis requires recovery",
                     f"session_id: {synth_session_id}\n"
@@ -1470,6 +1548,13 @@ VERDICT: AGREE. Preserve the supported conclusion and keep the report below
                     write_snapshot("INTERRUPTED DURING SYNTHESIS RECOVERY")
                     return 130
                 except Exception as recovery_error:
+                    if termination_pending(recovery_error):
+                        append_progress(
+                            "Run interrupted during synthesis recovery",
+                            "The active model process group was terminated.",
+                        )
+                        write_snapshot("INTERRUPTED DURING SYNTHESIS RECOVERY")
+                        return 130
                     print(
                         f"{SYS_COL}(synthesis and recovery failed; "
                         f"showing last agreed turn){RESET}"
