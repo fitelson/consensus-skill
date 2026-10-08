@@ -5,6 +5,8 @@ __pycache__/
 # Generated debate artifacts may contain private prompts and context.
 *.progress.md
 *.claude-stream.jsonl
+*.codex-stream.jsonl
+.consensus-*
 *.protocol.json
 consensus_[0-9]*.md
 CONSENSUS_*.md

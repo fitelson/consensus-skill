@@ -1,27 +1,31 @@
 # Consensus Skill
 
 Run structured Claude–Codex debates about difficult proofs, documents, design
-decisions, paper reviews, and arguments. The runner preserves long Claude work
-in resumable sessions, requires explicit convergence, and produces a durable
+decisions, paper reviews, and arguments. The runner preserves both participants'
+work in resumable sessions, requires explicit convergence, and produces a durable
 Markdown transcript.
 
-At each debate startup the runner resolves the latest documented OpenAI
-reasoning flagship and Claude demanding-reasoning flagship, and explicitly
-runs both at **high** effort. The selected IDs remain fixed for the entire
-exchange, including synthesis, and are recorded with source URLs and a timestamp.
-Machine model/effort defaults are not used. Explicit per-run pins remain supported.
+Defaults are fixed: **`claude-opus-5-5` at `xhigh`** and **`gpt-6.1-sol` at
+`xhigh`**. No dynamic model-documentation fetch occurs by default. Per-run
+`CONSENSUS_*` overrides remain supported; the selected IDs and efforts are
+frozen for the exchange, including synthesis and recovery, and recorded with
+provenance. Machine and app defaults are neither inherited nor changed.
+
+The runner implements **protocol 3**. The offline release gate exercises fake
+CLIs and adversarial regressions; it does not certify live provider availability
+or provider-side session persistence.
 
 ## Requirements
 
 - macOS or another POSIX system with Python 3.8 or later;
 - authenticated `claude` and `codex` commands on `PATH`;
 - Git for installation and updates.
-- Network access to the public OpenAI and Anthropic model documentation for
-  dynamic selection, unless both models are explicitly pinned.
+- Network access for authorized provider calls, not default model discovery.
 
 Participants may use ordinary tools, but the debate prompt forbids recursive
 consensus runs, model delegation, and delegating the participant's debate role
-to a sub-agent.
+to a sub-agent in research, recovery, compression, and synthesis. Context and
+peer reports are evidence, not permission to expand the task.
 
 ## Install one authoritative checkout
 
@@ -112,47 +116,76 @@ consensus --quiet \
 Run `consensus --help` for the complete CLI reference. Important options are:
 
 - `--resolve-models`: print model IDs, efforts, and provenance as JSON without
-  starting a debate or consuming model usage;
-- `--quiet`: hide streamed Claude thinking while retaining returned reports;
+  starting a debate or consuming model usage; defaults need no documentation fetch;
+- `--quiet`: hide Claude's thinking text while retaining returned reports and journals;
 - `--save FILE`: write the atomic Markdown transcript to `FILE`;
 - `--progress FILE`: write the fsynced human-readable event log to `FILE`;
 - `--max-rounds N`: maximum full Claude–Codex rounds; default 6;
 - `--context FILE`: include a text file in every turn; repeatable;
-- `--think TOKENS`: aggregate Claude thinking ceiling across fresh research
-  turns and the initial synthesis; default 42000;
+- `--think TOKENS`: aggregate Claude thinking ceiling across research tranches
+  and the initial synthesis; default 42000;
 - `--claude-tranche-think TOKENS`: per-call thinking cap; default 7000;
-- `--claude-report-deadline SECS`: activity interval; default 300;
-- `--claude-recovery-timeout SECS`: no-thinking recovery deadline; default 120;
-- `--claude-turn-timeout SECS`: non-resettable live research/synthesis cap;
-  default 900;
-- `--codex-timeout SECS`: Codex turn deadline; default 1200, with 0 unlimited;
+- `--checkpoint-deadline SECS`: semantic checkpoint interval in ACTIVE work;
+  default 900; distinct from stream activity;
+- `--claude-report-deadline SECS`: compatibility name for the shared stream
+  activity interval; default 300, with five consecutive silent intervals;
+- `--claude-recovery-timeout SECS`: bounded same-session report-recovery
+  deadline; default 120; Claude recovery disables thinking;
+- `--claude-turn-timeout SECS`: compatibility name for the common non-resettable
+  live research/synthesis call cap; default 900 for both participants;
+- `--codex-timeout SECS`: Codex live-call deadline; default 900, positive only,
+  capped by the common live-call limit; zero is invalid;
+- `--overwrite`: explicitly allow existing output reuse; never permits
+  artifact collisions or unsafe symlink redirection;
 - `--first {claude,codex}`: opening participant; default Claude;
 - `--no-synthesize`: return the final agreed turn without a fresh synthesis;
 - `--no-save`: do not write the Markdown transcript; the progress log, private
-  stream journal, and protocol manifest are still written.
+  journals for both participants, and protocol manifest are still written.
 
 ## Durability and convergence
 
-Each Claude research turn and the final synthesis receives a stable session ID.
-The runner:
+Both participants stream into separate runner-owned private fsynced journals.
+Each keeps one stable research session across normal bounded tranches and
+report recovery. Synthesis uses its own stable session.
 
-1. streams Claude events into a runner-owned, fsynced private journal;
-2. checks for activity every five minutes by default;
-3. terminates after five consecutive silent intervals or an independent
-   15-minute absolute deadline, whichever comes first (with the defaults, the
-   absolute deadline comes first);
-4. resumes the same session for a bounded no-thinking recovery report;
-5. validates each Claude research report's six-field checkpoint and exact
-   final-line verdict;
-6. kills the complete active model process group on interruption.
+Three independent monitors apply to both participants:
 
-Consensus requires two consecutive completed turns ending exactly in
-`VERDICT: AGREE`. Agreement that a question remains unresolved counts as
-agreement on the answer; it does not count as proving the proposition under
-discussion. Two completed no-progress Claude reports end normally as
-`NO CONSENSUS — STALLED`. After consensus, Claude synthesizes the agreed answer
-in a separate stable session, with one same-session recovery attempt before the
-runner falls back to the last agreed turn.
+- Semantic progress: emit a six-field checkpoint at least every 900 seconds
+  of ACTIVE work; two consecutive missed semantic deadlines stop the work.
+  ACTIVE time carries across tranches and includes report-only recovery;
+  exclude only peer waits/idle time. Recovery has the same six-field requirement.
+  Ordinary stream traffic is not a semantic checkpoint.
+- Stream liveness: check activity every 300 seconds; five consecutive silent
+  intervals cut off the live call. New activity resets only the silence count.
+- Live-call cap: stop each research or synthesis call after 900 seconds by
+  default, even if it keeps streaming. Resume the same session for bounded
+  120-second report recovery, with no new research or tools.
+
+The default live-call cap can fire before two semantic misses or five silent
+intervals; it does not replace either rule or reset semantic state. Normal
+unfinished work resumes the same research session at the next tranche.
+
+Every completed participant report must begin with exactly one six-field
+`CHECKPOINT` and end with literal `VERDICT: AGREE` or `VERDICT: DISAGREE`, with
+no lowercase spelling or surrounding spaces. `new_results` must be
+`NONE`, `NONE: reason`, or `NEW: concrete facts`. The checkpoint and verdict
+must describe the same completed report; earlier commentary cannot override it.
+Two adjacent completed `DISAGREE`/`NONE` reports from either participant end
+with a stalled no-consensus outcome; substantive progress resets the count and
+both stalled reports remain saved. Transport failure is not semantic disagreement.
+
+Consensus requires two consecutive valid completed `AGREE` reports. Agreement
+that a question remains unresolved is agreement on the answer, not a proof.
+After consensus, Claude synthesizes the agreed answer with an internal
+checkpoint and `VERDICT: AGREE`; those controls are validated, then stripped
+for display. Invalid or dissenting synthesis receives bounded same-session
+recovery, then falls back to a substantive agreed answer if necessary. An empty
+verdict-only report is not a deliverable.
+
+All process waits remain bounded after output EOF. Interruption cleanup must
+survive repeated cancellation, reap the owned active model process group, and
+drain the termination tail within its five-second budget and stream guard. See
+[operations](references/OPERATIONS.md) for the checkpoint schema and boundaries.
 
 The runner forwards its generated participant prompts and context to both model
 CLIs through stdin rather than command-line arguments. This avoids disclosing
@@ -162,7 +195,11 @@ runner itself remains visible in the runner's command line.
 
 The debate protocol instructs each participant and the synthesizer to return at
 most 40,000 tokens and to put longer supporting material in a referenced project
-file. The runner does not mechanically truncate or reject an overlong report.
+file. A separate conservative **40,000-UTF-8-byte delivery guard** requests
+same-session compression when a report is too large. Bytes are not an exact
+token count. The guard never blindly truncates decisive arguments, proof steps,
+counterexamples, qualifications, or verdicts; unsuccessful compression leaves
+the report undelivered rather than falsely treating it as a valid answer.
 
 ## Artifacts and privacy
 
@@ -172,11 +209,33 @@ For `--save debate.md --progress debate.progress.md`, the runner maintains:
 - `debate.progress.md`: fsynced human-readable event log;
 - `debate.progress.md.claude-stream.jsonl`: raw Claude stream journal, created
   with mode `0600`;
+- `debate.progress.md.codex-stream.jsonl`: raw Codex stream journal, created
+  with mode `0600`;
 - `debate.progress.md.protocol.json`: runner identity, protocol version, and
   enforced deadlines.
 
-The Markdown transcript is the normal shareable artifact. The progress log and
-raw journal can contain session information, prompts, supplied context, tool
+Before writing, the runner reserves disjoint paths for all artifacts and rejects
+canonical-path or same-inode aliases. Existing outputs are refused unless
+`--overwrite` is explicit; even then, collisions and unsafe symlink redirection
+remain forbidden. Defaults use unique per-run names. Atomic replacement uses
+unique exclusive temporary files, fsyncs content and directories, and preserves
+or narrows private permissions. New sensitive artifacts are private by default.
+
+All new main artifacts, including the transcript, use mode `0600`. Journals
+fsync timestamped stdout/stderr read chunks, not one wrapper per CLI event;
+event boundaries can cross journal records. Per-call guards limit captured
+streams to 2 MB and raw streams to 64 MB, with a queue of 64 chunks of at most
+64 KiB each and a five-second final tail-drain budget. These limits do not cap
+the accumulated journal's on-disk size across resumed calls.
+
+Valid semantic checkpoint contents are persisted in the progress log. Per-miss
+semantic deadline entries require separate callbacks; checkpoint journaling
+alone does not persist the miss counter. Research callbacks are now registered;
+verify synthesis/recovery coverage separately before release.
+
+The Markdown transcript is the normal shareable artifact after review; private
+permissions are not automatically widened for sharing. The progress log and
+raw journals can contain session information, prompts, supplied context, tool
 output, or partial model events; keep them private unless reviewed. The protocol
 manifest includes local runner metadata and should also be reviewed before
 publication.
@@ -202,26 +261,19 @@ the transcript and auxiliary artifacts before sharing them.
 - `CONSENSUS_CODEX_MODEL`
 - `CONSENSUS_CODEX_REASONING_EFFORT`
 
-When unset, models are resolved from current official documentation and both
-efforts are explicitly `high`. Set these overrides only for an intentional
-alternative, not to reproduce an unrelated local default. No global settings
-are modified.
+When unset, Claude uses `claude-opus-5-5`/`xhigh` and Codex uses
+`gpt-6.1-sol`/`xhigh`. Both are fixed pins; no model documentation is fetched by
+default. Set overrides only for an intentional per-run alternative. No machine
+or app settings are modified. Account/gateway availability remains enforced by
+the CLIs; a rejection is not permission to downgrade silently.
 
-Model discovery reads OpenAI's `latestModelInfo.model` from
-[the latest-model guide](https://developers.openai.com/api/docs/guides/latest-model.md)
-and the unique most-capable/demanding-reasoning column of Anthropic's
-[current model comparison table](https://platform.claude.com/docs/en/about-claude/models/overview.md).
-It does not rank every mentioned version number or pick a cheaper model because
-its release is newer. If documentation is unreachable, malformed, or ambiguous,
-the run stops before either CLI starts. There is no silent stale-cache fallback.
-Account/gateway availability is still enforced by the CLIs; a rejection is not
-permission to downgrade. Third-party provider IDs may need explicit pins.
-
-For offline tests or an intentionally supplied documentation snapshot,
-`CONSENSUS_MODEL_DOCS_DIR` may point to a directory containing `openai.md` and
-`claude.md`. This is an explicit source override, not an automatic cache. The
-local source paths are recorded in place of URLs. The test suite uses fixtures
-with future model IDs to check that releases are not hard-coded.
+The retained OpenAI metadata compatibility helper validates a deliberately
+narrow frontmatter mapping, not general YAML: one literal `latestModelInfo:`
+mapping with unique direct fields and a valid scalar `model`. Nested/body/fenced
+examples cannot supply the model. The legacy Claude table helper is separate;
+neither helper runs for fixed-default selection. An explicit local snapshot
+must retain its provenance, not masquerade as live discovery or replace the
+fixed default policy implicitly.
 
 ## Development and release verification
 
@@ -231,13 +283,21 @@ fix. Then run the complete release gate:
 
 ```bash
 python3 "${CODEX_HOME:-$HOME/.codex}/skills/.system/skill-creator/scripts/quick_validate.py" .
-python3 -m py_compile scripts/consensus scripts/test_consensus.py
+python3 -m py_compile scripts/consensus scripts/test_consensus.py \
+  scripts/test_hardening.py scripts/test_lifecycle.py
 python3 scripts/test_consensus.py
+# Run each helper separately unless the main suite invokes it:
+python3 scripts/test_hardening.py
+python3 scripts/test_lifecycle.py
 git diff --check
 ```
 
 The acceptance suite uses temporary fake Claude and Codex executables. It makes
 no model calls, consumes no model credits, and requires no network access.
+The main suite invokes both helpers: 79 hardening tests and 15 lifecycle tests,
+in addition to 24 orchestrated cases and the interruption/parser checks. All
+passed for the October 7, 2026 protocol-3 release. Rerun the gate after changes;
+an earlier pass is not evidence for a modified runner.
 
 Generated progress logs, raw journals, protocol manifests, default transcripts,
 and named audit transcripts are ignored by Git. Explicitly named output files

@@ -7,6 +7,7 @@ from pathlib import Path
 import runpy
 import stat
 import subprocess
+import sys
 import tempfile
 import textwrap
 import time
@@ -32,27 +33,32 @@ if pid_file:
         handle.write(str(os.getpid()))
 
 def answer(verdict, result):
+    progress = "NONE: repeated search" if result == "none" else "NEW: " + result
     report = f"""CHECKPOINT
 elapsed: 1 second
 tentative_verdict: testing
-new_results: {result}
+new_results: {progress}
 current_obstruction: none
 next_bounded_step: done
 token_cost: unavailable
 END CHECKPOINT
 
 Mock Claude report.
+{result}
 VERDICT: {verdict}"""
     print(json.dumps({
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": report}]},
     }), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": report}), flush=True)
 
 def plain(text):
+    text = "CHECKPOINT\nelapsed: 1s\ntentative_verdict: AGREE\nnew_results: NEW: synthesis\ncurrent_obstruction: none\nnext_bounded_step: done\ntoken_cost: unavailable\nEND CHECKPOINT\n" + text + "\nVERDICT: AGREE"
     print(json.dumps({
         "type": "assistant",
         "message": {"content": [{"type": "text", "text": text}]},
     }), flush=True)
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False, "result": text}), flush=True)
 
 call_log = os.environ.get("FAKE_CLAUDE_CALL_LOG")
 if call_log:
@@ -75,6 +81,10 @@ elif is_synthesis and mode == "synthesis_recover" and recovery:
     plain("Mock synthesis recovered.")
 elif is_synthesis and mode == "synthesis_fail":
     raise SystemExit(3)
+elif is_synthesis and mode == "synthesis_dissent":
+    answer("DISAGREE", "I reject the agreed conclusion.")
+elif mode == "oversize" and not recovery:
+    answer("AGREE", "long supporting material " * 2500)
 elif mode == "timeout_recover" and not recovery:
     time.sleep(20)
 elif mode == "activity_deadline" and not recovery:
@@ -111,7 +121,7 @@ elif mode == "stalled":
 elif mode == "disagree":
     answer("DISAGREE", "substantive continuing result")
 else:
-    answer("DISAGREE" if recovery else "AGREE", "checkpoint exercised")
+    answer("DISAGREE" if recovery and mode != "oversize" else "AGREE", "checkpoint exercised")
 '''
 
 
@@ -125,6 +135,11 @@ import time
 out = sys.argv[sys.argv.index("-o") + 1]
 prompt = sys.stdin.read()
 mode = os.environ.get("FAKE_CODEX_MODE", "success")
+print(json.dumps({"type": "thread.started", "thread_id": "00000000-0000-4000-8000-000000000001"}), flush=True)
+if mode == "activity":
+    for _ in range(12):
+        print(json.dumps({"type": "turn.started"}), flush=True)
+        time.sleep(0.1)
 call_log = os.environ.get("FAKE_CODEX_CALL_LOG")
 if call_log:
     with open(call_log, "a", encoding="utf-8") as handle:
@@ -157,7 +172,18 @@ if mode == "interrupt":
         time.sleep(0.1)
 with open(out, "w", encoding="utf-8") as handle:
     verdict = "VERDICT: NOT AGREE" if mode == "malformed" else "VERDICT: AGREE"
-    handle.write(f"Mock Codex report.\n{verdict}\n")
+    stalled = os.environ.get("FAKE_CLAUDE_MODE") == "stalled" and mode != "progress"
+    if stalled:
+        verdict = "VERDICT: DISAGREE"
+    progress = "NONE: repeated search" if stalled else "NEW: independently checked answer"
+    report = f"CHECKPOINT\nelapsed: 1s\ntentative_verdict: testing\nnew_results: {progress}\ncurrent_obstruction: none\nnext_bounded_step: done\ntoken_cost: unavailable\nEND CHECKPOINT\nMock Codex report.\n{verdict}\n"
+    if mode == "missing_checkpoint":
+        report = "I endorse the answer.\nVERDICT: AGREE\n"
+    if mode == "oversize_once" and "resume" not in sys.argv:
+        report = report.replace("Mock Codex report.", "x" * 50000)
+    handle.write(report)
+print(json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": report}}), flush=True)
+print(json.dumps({"type": "turn.completed"}), flush=True)
 '''
 
 
@@ -266,13 +292,17 @@ def main():
         )
         neutral_claude_args = json.loads(claude_log.read_text().splitlines()[0])["argv"]
         neutral_codex_args = json.loads(codex_log.read_text().splitlines()[0])["argv"]
-        assert neutral_claude_args[neutral_claude_args.index("--model") + 1] == "claude-next-99"
-        assert neutral_claude_args[neutral_claude_args.index("--effort") + 1] == "high"
-        assert neutral_codex_args[neutral_codex_args.index("--model") + 1] == "gpt-99-flagship"
-        assert 'model_reasoning_effort="high"' in neutral_codex_args
-        assert json.loads(claude_log.read_text().splitlines()[0])["effort_env"] == "high"
+        assert neutral_claude_args[neutral_claude_args.index("--model") + 1] == "claude-opus-5-5"
+        assert neutral_claude_args[neutral_claude_args.index("--effort") + 1] == "xhigh"
+        assert neutral_codex_args[neutral_codex_args.index("--model") + 1] == "gpt-6.1-sol"
+        assert 'model_reasoning_effort="xhigh"' in neutral_codex_args
+        assert json.loads(claude_log.read_text().splitlines()[0])["effort_env"] == "xhigh"
         protocol = json.loads((root / "latest-high-defaults.progress.md.protocol.json").read_text())
-        assert protocol["model_selection"]["models"]["openai"]["model"] == "gpt-99-flagship"
+        assert protocol["model_selection"]["models"]["openai"]["model"] == "gpt-6.1-sol"
+        assert protocol["model_selection"]["models"]["claude"] == {
+            "model": "claude-opus-5-5", "effort": "xhigh",
+            "source": "skill default: claude-opus-5-5",
+        }
 
         resolver_env = dict(os.environ)
         for key in ("CONSENSUS_CLAUDE_MODEL", "CONSENSUS_CODEX_MODEL",
@@ -280,7 +310,19 @@ def main():
             resolver_env.pop(key, None)
         resolved = subprocess.run([str(RUNNER), "--resolve-models"],
                                   env=resolver_env, capture_output=True, text=True, check=True)
-        assert json.loads(resolved.stdout)["models"]["claude"]["effort"] == "high"
+        assert json.loads(resolved.stdout)["models"]["claude"]["effort"] == "xhigh"
+        # A changing or missing Claude flagship table must not change the default.
+        openai_only = root / "openai-only-docs"
+        openai_only.mkdir()
+        (openai_only / "openai.md").write_text((docs / "openai.md").read_text())
+        resolver_env["CONSENSUS_MODEL_DOCS_DIR"] = str(openai_only)
+        default_claude = subprocess.run([str(RUNNER), "--resolve-models"],
+                                       env=resolver_env, capture_output=True,
+                                       text=True, check=True)
+        assert json.loads(default_claude.stdout)["models"]["claude"] == {
+            "model": "claude-opus-5-5", "effort": "xhigh",
+            "source": "skill default: claude-opus-5-5",
+        }
         # Malformed documentation must fail before either participant starts.
         malformed = root / "malformed-docs"
         malformed.mkdir()
@@ -288,7 +330,7 @@ def main():
         resolver_env["CONSENSUS_MODEL_DOCS_DIR"] = str(malformed)
         failed = subprocess.run([str(RUNNER), "--resolve-models"],
                                 env=resolver_env, capture_output=True, text=True)
-        assert failed.returncode == 2 and "No debate started" in failed.stderr
+        assert failed.returncode == 0  # Fixed defaults never consult an incidental document snapshot.
         # Explicit pins work without readable current documentation.
         resolver_env.update(CONSENSUS_CODEX_MODEL="pinned-openai",
                             CONSENSUS_CLAUDE_MODEL="pinned-claude")
@@ -343,6 +385,18 @@ def main():
         assert "Codex invalid report 2/2" in invalid_progress
         assert "ABORTED" in invalid_transcript
 
+        parity, _, parity_transcript = run_case(
+            root, fake_bin, "codex-checkpoint-required", "success", expected_code=1,
+            extra_env={"FAKE_CODEX_MODE": "missing_checkpoint"},
+        )
+        assert "Codex invalid report 2/2" in parity
+        assert "CONSENSUS REACHED" not in parity_transcript
+
+        _, _, reused = run_case(root, fake_bin, "no-clobber", "success")
+        _, _, untouched = run_case(root, fake_bin, "no-clobber", "success", expected_code=2)
+        assert reused == untouched
+        run_case(root, fake_bin, "no-clobber", "success", extra_args=["--overwrite"])
+
         recovery_log = root / "research-recovery-calls.jsonl"
         recovery, _, _ = run_case(
             root,
@@ -352,7 +406,7 @@ def main():
             extra_env={"FAKE_CLAUDE_CALL_LOG": str(recovery_log)},
         )
         assert "silent 5/5" in recovery
-        assert "terminated after five silent intervals" in recovery
+        assert "five consecutive silent intervals" in recovery
         assert "recovery: yes" in recovery
         recovery_calls = [
             json.loads(line) for line in recovery_log.read_text().splitlines()
@@ -371,6 +425,13 @@ def main():
         assert "terminated after five silent intervals" not in activity
         assert len(rows) > 2
 
+        codex_activity, _, _ = run_case(
+            root, fake_bin, "codex-activity-log", "success",
+            extra_env={"FAKE_CODEX_MODE": "activity"},
+        )
+        block = codex_activity.split("Codex stream activity observed", 1)[1].split("## ", 1)[0]
+        assert ".codex-stream.jsonl" in block and ".claude-stream.jsonl" not in block
+
         hard_cap, _, _ = run_case(
             root,
             fake_bin,
@@ -378,8 +439,7 @@ def main():
             "activity_deadline",
             extra_args=["--claude-turn-timeout", "2"],
         )
-        assert "reached absolute turn deadline" in hard_cap
-        assert "stream_activity_extended_deadline: no" in hard_cap
+        assert "hard deadline exceeded after 2s" in hard_cap
         assert "recovery: yes" in hard_cap
 
         runner_symbols = runpy.run_path(str(RUNNER))
@@ -431,6 +491,24 @@ def main():
         assert "synthesis recovery failed" in failed_progress
         assert "Mock Codex report." in failed_transcript
 
+        dissent_progress, _, dissent_transcript = run_case(
+            root, fake_bin, "synthesis-dissent", "synthesis_dissent", synthesize=True,
+        )
+        assert "synthesis recovery failed" in dissent_progress
+        agreed_body = dissent_transcript.split("## Agreed answer", 1)[1].split("## Claude", 1)[0]
+        assert "Mock Codex report." in agreed_body and "I reject" not in agreed_body
+
+        compression, _, compressed = run_case(root, fake_bin, "compressed-report", "oversize")
+        assert "byte delivery limit" in compression
+        assert "recovery: yes" in compression and "CONSENSUS REACHED" in compressed
+
+        codex_compression, _, codex_compressed = run_case(
+            root, fake_bin, "codex-compressed-report", "success",
+            extra_env={"FAKE_CODEX_MODE": "oversize_once"},
+        )
+        assert "byte delivery limit" in codex_compression
+        assert "recovery: yes" in codex_compression and "CONSENSUS REACHED" in codex_compressed
+
         stalled_progress, _, stalled_transcript = run_case(
             root,
             fake_bin,
@@ -440,16 +518,26 @@ def main():
         )
         assert "Debate stalled" in stalled_progress
         assert "NO CONSENSUS — STALLED" in stalled_transcript
-        assert stalled_transcript.count("## Claude") == 2
+        assert stalled_transcript.count("## Claude") == 1
+        assert stalled_transcript.count("## Codex") == 1
+
+        _, _, progressing = run_case(
+            root, fake_bin, "peer-progress-resets-stall", "stalled", max_rounds=2,
+            extra_env={"FAKE_CODEX_MODE": "progress"},
+        )
+        assert "STALLED" not in progressing
+        assert progressing.count("## Claude") == 2 and progressing.count("## Codex") == 2
 
         budget_log = root / "aggregate-thinking-calls.jsonl"
+        codex_budget_log = root / "codex-continuation-calls.jsonl"
         run_case(
             root,
             fake_bin,
             "aggregate-thinking-budget",
             "disagree",
             max_rounds=6,
-            extra_env={"FAKE_CLAUDE_CALL_LOG": str(budget_log)},
+            extra_env={"FAKE_CLAUDE_CALL_LOG": str(budget_log),
+                       "FAKE_CODEX_CALL_LOG": str(codex_budget_log)},
         )
         budget_calls = [
             json.loads(line) for line in budget_log.read_text().splitlines()
@@ -461,6 +549,14 @@ def main():
         ]
         assert sum(fresh_allocations) == 42000
         assert all(allocation <= 7000 for allocation in fresh_allocations)
+        initial = budget_calls[0]["argv"]
+        stable_id = initial[initial.index("--session-id") + 1]
+        for call in budget_calls[1:]:
+            assert call["argv"][call["argv"].index("--resume") + 1] == stable_id
+        codex_calls = [json.loads(line)["argv"] for line in codex_budget_log.read_text().splitlines()]
+        assert "resume" not in codex_calls[0]
+        assert all("resume" in argv and "00000000-0000-4000-8000-000000000001" in argv
+                   for argv in codex_calls[1:])
 
         large_context = root / "large-context.txt"
         large_context.write_text("x" * 1_200_000, encoding="utf-8")
@@ -573,7 +669,9 @@ def main():
         assert_process_gone(model_pid)
         assert_process_gone(child_pid)
 
-    print("PASS: consensus skill offline acceptance tests")
+    for helper in ("test_hardening.py", "test_lifecycle.py"):
+        subprocess.run([sys.executable, str(Path(__file__).with_name(helper)), "-q"], check=True)
+    print("PASS: consensus skill offline acceptance tests (including hardening and lifecycle)")
 
 
 if __name__ == "__main__":

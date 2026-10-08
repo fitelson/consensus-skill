@@ -1,4 +1,4 @@
 interface:
   display_name: "Consensus Debate"
-  short_description: "Run resumable Claude-Codex debates with durable recovery"
-  default_prompt: "Use $consensus to run a rigorous Claude-Codex debate with resumable sessions, an fsynced stream journal, and compressed reports."
+  short_description: "Run durable Claude-Codex audits with semantic checkpoints"
+  default_prompt: "Use $consensus for a Claude-Codex audit with fixed claude-opus-5-5/xhigh and gpt-6.1-sol/xhigh defaults, resumable sessions, and validated compressed reports."
