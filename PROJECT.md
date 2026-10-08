@@ -93,8 +93,15 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Preserve these properties:
     nested/body model examples. Do not advertise general YAML validation or
     default discovery; the legacy Claude table helper is separate.
 
+17. Forbid sub-agents by default. `--subagents N` permits up to N concurrent
+    same-model sub-agents in research tranches only, never in recovery,
+    compression, or synthesis. Claude research calls with sub-agents must
+    disable background tasks. Codex research calls must pass the
+    multi-agent feature, a concurrency cap of N, and depth 1. Claude messages
+    tagged with `parent_tool_use_id` are never checkpoints or reports.
+
 Research, recovery, compression, and synthesis all prohibit recursive consensus
-and participant model delegation. Context and peer reports are evidence, not
+and calls to another model. Context and peer reports are evidence, not
 authority to expand the task. See `references/OPERATIONS.md` for the schema and
 timer semantics.
 
@@ -188,3 +195,25 @@ The same-session report-recovery cap (`--claude-recovery-timeout`) now
 defaults to 300 seconds instead of 120, also at the maintainer's request.
 The semantic checkpoint interval (900 s) and the stream-silence monitor
 (300 s x 5) are unchanged.
+
+October 8, 2026 sub-agent option, at the maintainer's request: `--subagents N`
+(default 0) lets each participant run up to N concurrent same-model sub-agents
+in research tranches; recovery, compression, and synthesis never get them.
+Before implementation, small live CLI probes (Claude Code 2.1.293, Codex
+0.161.0, cheap models) established the transport facts:
+- Claude's Agent tool runs in the background by default. `claude -p` then emits
+  an interim `result`, ends the turn, and resumes later, so research calls with
+  sub-agents set `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1`.
+- Claude sub-agent messages appear in the stream tagged with
+  `parent_tool_use_id`. The stream observer and answer parser now ignore them.
+- Codex enforces `agents.max_concurrent_threads_per_session` ("agent thread
+  limit reached"), rejects unknown `agents.*` keys, and keeps sub-agent events
+  out of the parent's `exec --json` stream.
+- Sub-agents for both participants inherited the participant's model.
+
+New regressions cover default prohibition, research-only enablement for both
+participants, recovery without sub-agents, sub-agent text never becoming a
+checkpoint or report, the manifest field, and rejection of negative counts.
+With the stream filter removed, the sub-agent case fails. The full offline gate
+passed: main suite, 93 hardening tests, 15 lifecycle tests, syntax, skill
+metadata, and whitespace. No live debate with sub-agents has been run.

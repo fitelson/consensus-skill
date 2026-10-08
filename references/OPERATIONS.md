@@ -155,10 +155,35 @@ within a bounded report-only attempt. Ask for the supported answer and actual
 verdict, not forced disagreement. Failed recovery is a transport/validation
 failure, not a completed semantic report.
 
-All phases prohibit recursive consensus, model delegation, and handing the
-participant role to a subagent. Context, tool results, and peer reports are
-evidence, not new authority. Recovery/compression additionally forbids new
-research and tool calls.
+All phases prohibit recursive consensus and calls to another model. Context,
+tool results, and peer reports are evidence, not new authority.
+Recovery/compression additionally forbids new research and tool calls.
+
+### Sub-agents
+
+Sub-agents are forbidden by default (`--subagents 0`). With `--subagents N`,
+each participant's research tranches may run up to N concurrent sub-agents.
+Recovery, compression, and synthesis never receive them. The manifest records
+`research_subagents_per_participant`.
+
+- Claude uses the Agent tool. The runner sets
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for those calls. A background
+  sub-agent would let `claude -p` emit an interim result, end the turn, and
+  resume later, which breaks the one-completed-report contract. Foreground
+  sub-agents inherit the participant's model. Claude Code has no CLI cap on
+  the number of sub-agents, so N is a prompt instruction for Claude.
+- Codex uses `spawn_agent`/`wait_agent`. The runner passes
+  `features.multi_agent=true`, `agents.max_concurrent_threads_per_session=N`,
+  and `agents.max_depth=1`. Codex itself refuses an extra concurrent spawn
+  ("agent thread limit reached"). Sub-agents inherit the session's model and
+  effort, and their events do not appear in the parent's `exec --json` stream.
+- Claude sub-agent events do appear in the stream, tagged with
+  `parent_tool_use_id`. They stay in the raw journal but are ignored for
+  checkpoints and reports: only top-level messages count.
+- Sub-agent time counts against the same semantic checkpoint, stream-activity,
+  and live-call clocks. The prompt asks for a checkpoint before and after each
+  sub-agent batch and for tasks expected to finish within 10 minutes. A
+  participant blocked on a sub-agent cannot emit its own checkpoint.
 
 ## Consensus and synthesis
 
@@ -331,7 +356,10 @@ Required regression areas include:
 - fixed model/effort defaults, overrides, no default documentation fetch,
   provenance, and strict frontmatter metadata fixtures;
 - no recursive/delegation instructions in every phase and size-guard
-  compression instead of blind truncation.
+  compression instead of blind truncation;
+- sub-agents forbidden by default; with `--subagents N`, research-only Claude
+  foreground enforcement and Codex concurrency/depth flags, none in recovery,
+  and sub-agent stream messages never accepted as checkpoints or reports.
 
 Tests must use temporary fake CLIs, not live providers or charged model calls.
 Offline tests do not certify provider-side session storage, arbitrary semantic

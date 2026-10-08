@@ -23,9 +23,10 @@ or provider-side session persistence.
 - Network access for authorized provider calls, not default model discovery.
 
 Participants may use ordinary tools, but the debate prompt forbids recursive
-consensus runs, model delegation, and delegating the participant's debate role
-to a sub-agent in research, recovery, compression, and synthesis. Context and
-peer reports are evidence, not permission to expand the task.
+consensus runs and calls to another model in research, recovery, compression,
+and synthesis. Sub-agents are forbidden by default; `--subagents N` allows up to
+N concurrent same-model sub-agents in research turns only. Context and peer
+reports are evidence, not permission to expand the task.
 
 ## Install one authoritative checkout
 
@@ -122,6 +123,9 @@ Run `consensus --help` for the complete CLI reference. Important options are:
 - `--progress FILE`: write the fsynced human-readable event log to `FILE`;
 - `--max-rounds N`: maximum full Claude–Codex rounds; default 6;
 - `--context FILE`: include a text file in every turn; repeatable;
+- `--subagents N`: let each participant run up to N concurrent same-model
+  sub-agents during research turns; default 0, which forbids them. Recovery,
+  compression, and synthesis never get sub-agents;
 - `--think TOKENS`: aggregate Claude thinking ceiling across research tranches
   and the initial synthesis; default 42000;
 - `--claude-tranche-think TOKENS`: per-call thinking cap; default 7000;

@@ -82,6 +82,9 @@ if call_log:
             "thinking_tokens": os.environ.get("MAX_THINKING_TOKENS"),
             "thinking_disabled": os.environ.get("CLAUDE_CODE_DISABLE_THINKING") == "1",
             "effort_env": os.environ.get("CLAUDE_CODE_EFFORT_LEVEL"),
+            "background_disabled": os.environ.get("CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"),
+            "subagent_rule": "- Sub-agents:" in prompt,
+            "forbids_subagents": "delegate your role to a sub-agent" in prompt,
         }) + "\n")
 
 if is_synthesis and mode == "synthesis_success":
@@ -137,6 +140,25 @@ elif mode == "activity":
         print(json.dumps({"type": "system", "subtype": "status", "n": n}), flush=True)
         time.sleep(0.7)
     answer("AGREE", "activity reset exercised")
+elif mode == "subagent_stream" and not recovery:
+    leak = ("CHECKPOINT\nelapsed: 1s\ntentative_verdict: DISAGREE\n"
+            "new_results: NEW: SUBAGENT-LEAK\ncurrent_obstruction: none\n"
+            "next_bounded_step: done\ntoken_cost: unavailable\nEND CHECKPOINT\n"
+            "SUBAGENT-LEAK\nVERDICT: DISAGREE")
+    def subagent_message():
+        print(json.dumps({"type": "assistant", "parent_tool_use_id": "offline-agent",
+            "message": {"content": [{"type": "text", "text": leak}]}}), flush=True)
+    subagent_message()
+    report = ("CHECKPOINT\nelapsed: 1s\ntentative_verdict: AGREE\n"
+              "new_results: NEW: parent verified sub-agent evidence\n"
+              "current_obstruction: none\nnext_bounded_step: done\n"
+              "token_cost: unavailable\nEND CHECKPOINT\nMock parent report.\nVERDICT: AGREE")
+    print(json.dumps({"type": "assistant",
+        "message": {"content": [{"type": "text", "text": report}]}}), flush=True)
+    subagent_message()
+    # An empty result string makes the runner fall back to the last parent message.
+    print(json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                      "result": ""}), flush=True)
 elif mode == "stalled":
     answer("DISAGREE", "none")
 elif mode == "disagree":
@@ -170,6 +192,7 @@ if call_log:
         handle.write(json.dumps({
             "argv": sys.argv[1:],
             "prompt_length": len(prompt),
+            "subagent_rule": "- Sub-agents:" in prompt,
         }) + "\n")
 pid_file = os.environ.get("FAKE_CODEX_PID_FILE")
 if pid_file:
@@ -406,6 +429,69 @@ def main():
         assert override_claude_args[override_claude_args.index("--effort") + 1] == "high"
         assert override_codex_args[override_codex_args.index("--model") + 1] == "mock-codex"
         assert 'model_reasoning_effort="high"' in override_codex_args
+
+        # Sub-agents stay forbidden unless a run opts in with --subagents N.
+        default_claude = json.loads((root / "latest-claude.jsonl").read_text().splitlines()[0])
+        default_codex = json.loads((root / "latest-codex.jsonl").read_text().splitlines()[0])
+        assert default_claude["background_disabled"] is None
+        assert default_claude["forbids_subagents"] and not default_claude["subagent_rule"]
+        assert not default_codex["subagent_rule"]
+        assert not any(arg.startswith(("agents.", "features.multi_agent"))
+                       for arg in default_codex["argv"])
+        assert json.loads((root / "latest-high-defaults.progress.md.protocol.json")
+                          .read_text())["research_subagents_per_participant"] == 0
+
+        claude_log = root / "subagents-claude.jsonl"
+        codex_log = root / "subagents-codex.jsonl"
+        sub_progress, _, sub_transcript = run_case(
+            root, fake_bin, "subagents", "subagent_stream", extra_args=["--subagents", "3"],
+            extra_env={"FAKE_CLAUDE_CALL_LOG": str(claude_log),
+                       "FAKE_CODEX_CALL_LOG": str(codex_log)},
+        )
+        sub_claude = json.loads(claude_log.read_text().splitlines()[0])
+        sub_codex = json.loads(codex_log.read_text().splitlines()[0])
+        assert sub_claude["background_disabled"] == "1"
+        assert sub_claude["subagent_rule"] and not sub_claude["forbids_subagents"]
+        assert sub_codex["subagent_rule"]
+        for flag in ("features.multi_agent=true",
+                     "agents.max_concurrent_threads_per_session=3", "agents.max_depth=1"):
+            assert flag in sub_codex["argv"]
+        # Sub-agent text never becomes the participant's checkpoint or report.
+        assert "CONSENSUS REACHED" in sub_transcript and "Mock parent report." in sub_transcript
+        assert "SUBAGENT-LEAK" not in sub_progress + sub_transcript
+        assert "up to 3 at a time" in sub_progress
+        assert json.loads((root / "subagents.progress.md.protocol.json")
+                          .read_text())["research_subagents_per_participant"] == 3
+
+        # Recovery tranches never receive sub-agents, for either participant.
+        claude_log = root / "subagents-recovery-claude.jsonl"
+        codex_log = root / "subagents-recovery-codex.jsonl"
+        sub_recovery, _, _ = run_case(
+            root, fake_bin, "subagents-recovery", "timeout_recover",
+            extra_args=["--subagents", "2"],
+            extra_env={"FAKE_CLAUDE_CALL_LOG": str(claude_log),
+                       "FAKE_CODEX_CALL_LOG": str(codex_log),
+                       "FAKE_CODEX_MODE": "oversize_once"},
+        )
+        assert sub_recovery.count("recovery: yes") >= 2
+        claude_calls = [json.loads(line) for line in claude_log.read_text().splitlines()]
+        codex_calls = [json.loads(line)["argv"] for line in codex_log.read_text().splitlines()]
+        assert claude_calls[0]["background_disabled"] == "1"
+        assert claude_calls[1]["background_disabled"] is None
+        assert "agents.max_concurrent_threads_per_session=2" in codex_calls[0]
+        assert "resume" in codex_calls[1]
+        assert not any(arg.startswith("agents.") for arg in codex_calls[1])
+
+        rejected = subprocess.run([str(RUNNER), "--subagents", "-1", "--no-save", "q"],
+                                  capture_output=True, text=True)
+        assert rejected.returncode == 2 and "nonnegative" in rejected.stderr
+        mixed = "\n".join(json.dumps(event) for event in (
+            {"type": "assistant", "message": {"content": [{"type": "text", "text": "parent"}]}},
+            {"type": "assistant", "parent_tool_use_id": "offline-agent",
+             "message": {"content": [{"type": "text", "text": "sub-agent"}]}},
+            {"type": "result", "subtype": "success", "is_error": False, "result": ""},
+        ))
+        assert symbols["claude_answer"](mixed)[1] == "parent"
 
         invalid_progress, _, invalid_transcript = run_case(
             root,
