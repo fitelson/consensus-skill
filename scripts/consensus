@@ -60,6 +60,7 @@ REPORT_MAX_TOKENS = 40000
 REPORT_MAX_BYTES = 40000
 CAPTURE_MAX_BYTES = 2_000_000
 STREAM_MAX_BYTES = 64_000_000
+EVENT_MAX_BYTES = 8_000_000
 CHECKPOINT_DEADLINE = 900
 
 
@@ -470,7 +471,7 @@ def private_open(path, *, exclusive=False):
 def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
                    checkpoint_interval=None, max_checkpoint_misses=None,
                    checkpoint_event=None, stream_journal=None,
-                   text_observer=None, semantic_monitor=None):
+                   text_observer=None, semantic_monitor=None, capture_output=True):
     """Bound memory and waits, while durably spooling both participants' streams."""
     events = queue.Queue(maxsize=64)
     stop = threading.Event()
@@ -528,12 +529,13 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
             journal.flush()
             os.fsync(journal.fileno())
         last_activity = time.monotonic()
-        if captured + len(chunk) <= CAPTURE_MAX_BYTES:
-            captured += len(chunk)
-            output[name].append(text)
-        elif capture:
-            raise StreamLimitExceeded("captured stream exceeded byte limit")
-        if text_observer and captured < CAPTURE_MAX_BYTES:
+        if capture_output:
+            if captured + len(chunk) <= CAPTURE_MAX_BYTES:
+                captured += len(chunk)
+                output[name].append(text)
+            elif capture:
+                raise StreamLimitExceeded("captured stream exceeded byte limit")
+        if text_observer and (not capture_output or captured < CAPTURE_MAX_BYTES):
             text_observer(name, text)
 
     try:
@@ -624,59 +626,140 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
                 semantic_monitor.last_time = None
 
 
-def stream_observer(provider, monitor=None, checkpoint_report=None, session=None,
-                    session_started=None):
-    buffer = ""
-    seen = set()
-    def observe(name, text):
-        nonlocal buffer
+class StreamObserver:
+    """Frame one bounded JSON event at a time; retain only report/control data."""
+    def __init__(self, provider, monitor=None, checkpoint_report=None, session=None,
+                 session_started=None):
+        self.provider = provider
+        self.monitor = monitor
+        self.checkpoint_report = checkpoint_report
+        self.session = session
+        self.session_started = session_started
+        self.fragments = []
+        self.event_bytes = 0
+        self.records = {}
+        self.seen = {}
+        self.thinking = ""
+        self.terminal_error = False
+
+    def __call__(self, name, text):
         if name != "stdout":
             return
-        buffer += text
-        if len(buffer.encode("utf-8")) > CAPTURE_MAX_BYTES:
-            raise StreamLimitExceeded("JSON stream line exceeded byte limit")
-        while "\n" in buffer:
-            line, buffer = buffer.split("\n", 1)
-            try:
-                obj = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            report = ""
-            message_id = None
-            if provider == "Claude" and obj.get("type") == "assistant":
-                message = obj.get("message")
-                blocks = message.get("content", []) if isinstance(message, dict) else []
-                message_id = message.get("id") if isinstance(message, dict) else None
-                report = "\n".join(b.get("text", "") for b in blocks
-                                   if isinstance(b, dict) and isinstance(b.get("text"), str))
-            elif provider == "Codex":
-                if obj.get("type") == "thread.started" and session is not None:
-                    value = obj.get("thread_id")
-                    if isinstance(value, str):
-                        value = str(uuid.UUID(value))
-                        if session.get("id") and session["id"] != value:
-                            raise RuntimeError("Codex changed its stable research session")
-                        first = not session.get("id")
-                        session["id"] = value
-                        if first and session_started:
-                            session_started(value)
-                item = obj.get("item")
-                if obj.get("type") == "item.completed" and isinstance(item, dict) and item.get("type") == "agent_message":
+        parts = text.split("\n")
+        for index, part in enumerate(parts):
+            self.event_bytes += len(part.encode("utf-8"))
+            if self.event_bytes > EVENT_MAX_BYTES:
+                raise StreamLimitExceeded("individual JSON event exceeded byte limit")
+            if part:
+                self.fragments.append(part)
+            if index < len(parts) - 1:
+                line = "".join(self.fragments)
+                self.fragments.clear()
+                self.event_bytes = 0
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                self.process(event)
+
+    def process(self, event):
+        if not isinstance(event, dict):
+            self.terminal_error = True
+            return
+        kind = event.get("type")
+        report = ""
+        message_id = None
+        if self.provider == "Claude":
+            if kind not in {"assistant", "result", "error"}:
+                return
+            if kind == "error":
+                self.terminal_error = True
+            elif kind == "result":
+                if event.get("is_error") is not False or event.get("subtype") != "success":
+                    self.terminal_error = True
+                self.records["terminal"] = {key: event[key] for key in
+                    ("type", "is_error", "subtype", "result") if key in event}
+            elif kind == "assistant":
+                message = event.get("message")
+                blocks = message.get("content") if isinstance(message, dict) else None
+                if not isinstance(blocks, list):
+                    self.terminal_error = True
+                    return
+                selected = []
+                for block in blocks:
+                    if not isinstance(block, dict):
+                        self.terminal_error = True
+                        continue
+                    if block.get("type") == "text":
+                        if not isinstance(block.get("text"), str):
+                            self.terminal_error = True
+                        selected.append({"type": "text", "text": block.get("text")})
+                    elif isinstance(block.get("thinking"), str):
+                        self.thinking = (self.thinking + block["thinking"])[-262144:]
+                message_id = message.get("id")
+                report = "\n".join(block["text"] for block in selected
+                                   if isinstance(block.get("text"), str))
+                if not selected and "message" in self.records:
+                    selected = [block for block in self.records["message"]["message"]["content"]
+                                if block.get("type") == "text"]
+                if self.thinking:
+                    selected.append({"type": "thinking", "thinking": self.thinking})
+                self.records["message"] = {"type": "assistant", "message": {"content": selected}}
+        else:
+            if kind not in {"error", "turn.failed", "turn.completed", "thread.started", "item.completed"}:
+                return
+            if kind in {"error", "turn.failed"}:
+                self.terminal_error = True
+            elif kind == "turn.completed":
+                self.records["terminal"] = {"type": "turn.completed"}
+            elif kind == "thread.started" and self.session is not None:
+                value = event.get("thread_id")
+                if not isinstance(value, str):
+                    raise RuntimeError("invalid Codex session identity")
+                value = str(uuid.UUID(value))
+                if self.session.get("id") and self.session["id"] != value:
+                    raise RuntimeError("Codex changed its stable research session")
+                first = not self.session.get("id")
+                self.session["id"] = value
+                if first and self.session_started:
+                    self.session_started(value)
+            elif kind == "item.completed":
+                item = event.get("item")
+                if isinstance(item, dict) and item.get("type") == "agent_message":
                     message_id = item.get("id")
                     report = item.get("text", "")
-            if isinstance(report, str):
-                cp = checkpoint_of(report)
-                signature = json.dumps(cp, sort_keys=True) if cp else None
-                identity = (message_id, signature)
-                if cp and identity not in seen:
-                    seen.add(identity)
-                    if monitor:
-                        monitor.observe(cp)
-                    if checkpoint_report:
-                        checkpoint_report(cp)
-    return observe
+                    self.records["message"] = {"type": kind, "item":
+                        {key: item[key] for key in ("id", "type", "text") if key in item}}
+                else:
+                    return
+        # Input images, tool results, partial events, and signatures stay in the
+        # raw journal; they must never consume the returned-report capture quota.
+        if len(self.collected_stdout().encode("utf-8")) > CAPTURE_MAX_BYTES:
+            raise StreamLimitExceeded("semantic report capture exceeded byte limit")
+        if isinstance(report, str):
+            cp = checkpoint_of(report)
+            signature = json.dumps(cp, sort_keys=True) if cp else None
+            if signature and len(signature.encode("utf-8")) <= REPORT_MAX_BYTES:
+                identity = (message_id if isinstance(message_id, str) else None, signature)
+                if identity not in self.seen:
+                    self.seen[identity] = None
+                    if len(self.seen) > 128:
+                        self.seen.pop(next(iter(self.seen)))
+                    if self.monitor:
+                        self.monitor.observe(cp)
+                    if self.checkpoint_report:
+                        self.checkpoint_report(cp)
+
+    def collected_stdout(self):
+        values = list(self.records.values())
+        if self.terminal_error:
+            values.insert(0, {"type": "error"})
+        return "\n".join(json.dumps(event, ensure_ascii=False) for event in values)
+
+
+def stream_observer(provider, monitor=None, checkpoint_report=None, session=None,
+                    session_started=None):
+    return StreamObserver(provider, monitor, checkpoint_report, session, session_started)
 
 
 def claude_answer(stdout):
@@ -737,17 +820,19 @@ def run_claude(prompt, think_budget, timeout=None, *, session_id=None,
     env["CLAUDE_CODE_EFFORT_LEVEL"] = CLAUDE_EFFORT
     if session_id:
         cmd.extend(["--resume" if resume else "--session-id", session_id])
+    observer = stream_observer("Claude", semantic_monitor, checkpoint_report)
     code, stdout, _ = _run_streaming(
         cmd, env, timeout or None, stdin_text=prompt,
         checkpoint_file=checkpoint_file, checkpoint_interval=CLAUDE_REPORT_DEADLINE,
         max_checkpoint_misses=CLAUDE_MAX_CONSECUTIVE_MISSES,
         checkpoint_event=checkpoint_event, stream_journal=stream_journal,
-        text_observer=stream_observer("Claude", semantic_monitor, checkpoint_report),
+        text_observer=observer,
         semantic_monitor=semantic_monitor,
+        capture_output=False,
     )
     if code:
         raise RuntimeError(f"claude exited with status {code}")
-    return claude_answer(stdout)
+    return claude_answer(stdout or observer.collected_stdout())
 
 
 def checkpoint_of(text):
@@ -804,17 +889,20 @@ def run_codex(prompt, *, session=None, timeout=None, stream_journal=None,
                     "-o", out.name])
         if session.get("id"):
             cmd.extend([session["id"], "-"])
+        observer = stream_observer("Codex", semantic_monitor, checkpoint_report, session,
+                                   session_started)
         code, stdout, _ = _run_streaming(
             cmd, dict(os.environ), timeout or CODEX_TIMEOUT, stdin_text=prompt,
             checkpoint_interval=CLAUDE_REPORT_DEADLINE,
             max_checkpoint_misses=CLAUDE_MAX_CONSECUTIVE_MISSES,
             checkpoint_event=checkpoint_event, stream_journal=stream_journal,
-            text_observer=stream_observer("Codex", semantic_monitor, checkpoint_report, session,
-                                          session_started),
+            text_observer=observer,
             semantic_monitor=semantic_monitor,
+            capture_output=False,
         )
         if code:
             raise RuntimeError(f"codex exited with status {code}")
+        stdout = stdout or observer.collected_stdout()
         completed = False
         for line in stdout.splitlines():
             try:
@@ -902,6 +990,7 @@ def main():
     global CLAUDE_TURN_TIMEOUT, CODEX_TIMEOUT
     global CLAUDE_MODEL, CODEX_MODEL
     global CHECKPOINT_DEADLINE
+    global STREAM_MAX_BYTES, EVENT_MAX_BYTES
     ap = argparse.ArgumentParser(description="Claude <-> Codex debate to consensus.")
     ap.add_argument("question", nargs="*", help="the question (or pipe via stdin)")
     ap.add_argument("--max-rounds", type=int, default=6,
@@ -924,6 +1013,10 @@ def main():
     ap.add_argument("--overwrite", action="store_true", help="explicitly replace existing output artifacts")
     ap.add_argument("--checkpoint-deadline", type=int, default=900,
                     help="semantic checkpoint interval for both participants (default 900)")
+    ap.add_argument("--stream-max-bytes", type=int, default=STREAM_MAX_BYTES,
+                    help="raw transport limit per call, including media (default 64000000)")
+    ap.add_argument("--event-max-bytes", type=int, default=EVENT_MAX_BYTES,
+                    help="maximum individual JSON event size (default 8000000)")
     ap.add_argument("--no-synthesize", action="store_true",
                     help="on consensus, print the last turn verbatim instead of a synthesized answer")
     ap.add_argument("--context", action="append", metavar="FILE", default=[],
@@ -966,6 +1059,10 @@ def main():
     CLAUDE_TURN_TIMEOUT = args.claude_turn_timeout
     CODEX_TIMEOUT = min(args.codex_timeout, args.claude_turn_timeout)
     CHECKPOINT_DEADLINE = args.checkpoint_deadline
+    if args.stream_max_bytes <= 0 or args.event_max_bytes <= 0:
+        ap.error("stream and event byte limits must be positive")
+    STREAM_MAX_BYTES = args.stream_max_bytes
+    EVENT_MAX_BYTES = args.event_max_bytes
 
     try:
         model_selection = resolve_models()
@@ -1069,6 +1166,8 @@ def main():
         "report_max_bytes": REPORT_MAX_BYTES,
         "capture_max_bytes": CAPTURE_MAX_BYTES,
         "stream_max_bytes": STREAM_MAX_BYTES,
+        "event_max_bytes": EVENT_MAX_BYTES,
+        "capture_policy": "bounded semantic controls only; media and diagnostics journaled to disk",
         "stream_activity_extends_absolute_deadline": False,
     }
     atomic_write(protocol_path, json.dumps(manifest, indent=2) + "\n")

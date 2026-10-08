@@ -206,11 +206,22 @@ synthesis paths must remain within bounded waits and owned cleanup. Repeated
 cancellation must not interrupt process-group escalation and reaping. Do not
 claim successful cleanup until the owned processes have been reaped.
 
-Stream capture is limited to 2,000,000 bytes (2 MB), and the raw-stream guard is
-64,000,000 bytes (64 MB), counting stdout and stderr together per call. These
-limits count incoming bytes, not JSONL wrapper overhead or the accumulated
-journal size across calls. Exceeding a guard fails the call rather than
-delivering a silently truncated answer.
+Provider calls retain only bounded report/control data in memory (2,000,000
+bytes), not the entire incoming stream. Input images, tool results, partial
+messages, signatures, and stderr stay in the private disk journal. Each JSON
+event is parsed separately within an 8,000,000-byte limit; completed reports
+and explicit terminal errors are still validated. Superseded report records
+are replaced, not accumulated. Printed thinking is a bounded diagnostic view;
+the raw journal retains the original within its transport limits.
+
+The raw-stream guard defaults to 64,000,000 bytes, counting stdout and stderr
+together per call. `--stream-max-bytes` explicitly adjusts that disk/transport
+budget; `--event-max-bytes` adjusts the individual JSON-event parsing budget.
+Neither changes the returned-report byte guard or semantic checkpoint policy.
+Limits count incoming bytes, not JSONL wrapper overhead or journal size across
+calls. Exceeding a guard fails the call rather than delivering a truncated
+answer. Generic unfiltered capture still has a cumulative 2 MB guard, but the
+Claude/Codex wrappers use filtered streaming instead.
 
 The reader queue holds at most 64 chunks, each at most 65,536 bytes (64 KiB).
 After process cleanup, the final tail-drain loop has a five-second budget and

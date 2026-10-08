@@ -127,6 +127,9 @@ Run `consensus --help` for the complete CLI reference. Important options are:
 - `--claude-tranche-think TOKENS`: per-call thinking cap; default 7000;
 - `--checkpoint-deadline SECS`: semantic checkpoint interval in ACTIVE work;
   default 900; distinct from stream activity;
+- `--stream-max-bytes N`: raw transport/disk budget per call, including images;
+  default 64000000. Media does not consume the semantic report-capture quota;
+- `--event-max-bytes N`: per-JSON-event parsing budget; default 8000000;
 - `--claude-report-deadline SECS`: compatibility name for the shared stream
   activity interval; default 300, with five consecutive silent intervals;
 - `--claude-recovery-timeout SECS`: bounded same-session report-recovery
@@ -223,15 +226,18 @@ or narrows private permissions. New sensitive artifacts are private by default.
 
 All new main artifacts, including the transcript, use mode `0600`. Journals
 fsync timestamped stdout/stderr read chunks, not one wrapper per CLI event;
-event boundaries can cross journal records. Per-call guards limit captured
-streams to 2 MB and raw streams to 64 MB, with a queue of 64 chunks of at most
-64 KiB each and a five-second final tail-drain budget. These limits do not cap
-the accumulated journal's on-disk size across resumed calls.
+event boundaries can cross journal records. Provider calls retain only the
+latest report/control records (2 MB maximum), not image/tool payloads or partial
+events. Raw streams go to disk with a 64 MB per-call default; individual JSON
+events have an 8 MB default. Both transport limits can be explicitly adjusted
+without changing report/checkpoint limits. The queue remains bounded to 64
+chunks of at most 64 KiB, with a five-second final tail-drain budget. These
+limits do not cap journal size accumulated across resumed calls.
 
 Valid semantic checkpoint contents are persisted in the progress log. Per-miss
 semantic deadline entries require separate callbacks; checkpoint journaling
-alone does not persist the miss counter. Research callbacks are now registered;
-verify synthesis/recovery coverage separately before release.
+alone does not persist the miss counter. Both research monitors and synthesis
+register these callbacks, including same-session recovery.
 
 The Markdown transcript is the normal shareable artifact after review; private
 permissions are not automatically widened for sharing. The progress log and
@@ -294,10 +300,11 @@ git diff --check
 
 The acceptance suite uses temporary fake Claude and Codex executables. It makes
 no model calls, consumes no model credits, and requires no network access.
-The main suite invokes both helpers: 79 hardening tests and 15 lifecycle tests,
-in addition to 24 orchestrated cases and the interruption/parser checks. All
-passed for the October 7, 2026 protocol-3 release. Rerun the gate after changes;
-an earlier pass is not evidence for a modified runner.
+The main suite invokes both helpers: 88 hardening tests and 15 lifecycle tests,
+in addition to 27 orchestrated cases and the interruption/parser checks.
+Coverage includes multi-page image streams, individual images larger than the
+old capture limit, terminal failures after images, and report/control filtering.
+Rerun the gate after changes; an earlier pass is not evidence for a modified runner.
 
 Generated progress logs, raw journals, protocol manifests, default transcripts,
 and named audit transcripts are ignored by Git. Explicitly named output files

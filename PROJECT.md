@@ -84,8 +84,10 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Preserve these properties:
 15. Bound all process waits, including after output EOF. Cleanup must survive
     repeated cancellation, reap the owned active process group, and persist
     retained termination-tail chunks with a five-second drain budget. Bound
-    per-call capture to 2 MB, raw streams to 64 MB, and the queue to 64 chunks
-    of at most 64 KiB each; do not claim unlimited lossless tail capture.
+    retained report/control capture to 2 MB, individual JSON events to 8 MB,
+    raw streams to 64 MB by default, and the queue to 64 chunks of at most
+    64 KiB each. Media/tool/partial events remain in the private disk journal,
+    not cumulative memory capture. Do not claim unlimited lossless tail capture.
 16. Keep the retained OpenAI metadata helper a narrow frontmatter mapping
     validator: reject malformed supported forms, duplicate mapping fields, and
     nested/body model examples. Do not advertise general YAML validation or
@@ -147,3 +149,14 @@ The newest maintainer instruction sets fixed `claude-opus-5-5`/`xhigh` and
 `gpt-6.1-sol`/`xhigh` defaults, superseding dynamic model discovery and high
 effort. Per-run overrides remain. Installed entrypoints use this checkout;
 machine/app model settings were not changed.
+
+October 7, 2026 image-stream follow-up: page-image and tool payloads are now
+journaled to disk without consuming the cumulative report-capture quota.
+Provider calls retain only bounded report/control records and frame one bounded
+JSON event at a time. Explicit transport/event budget flags leave report guards,
+checkpoint enforcement, and model defaults unchanged. Replay of the actual
+failed stream processed 2,329,430 raw bytes with only 49 retained control bytes;
+that aborted stream had no final report, so replay verifies transport, not the
+research verdict. The expanded release gate includes 27 orchestrated cases,
+88 hardening tests, and 15 lifecycle tests, all passed. Syntax, skill metadata,
+local documentation links, and whitespace checks also passed.

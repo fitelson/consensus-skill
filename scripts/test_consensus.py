@@ -32,6 +32,16 @@ if pid_file:
     with open(pid_file, "w", encoding="utf-8") as handle:
         handle.write(str(os.getpid()))
 
+if mode in {"page_images", "large_page_image", "page_images_terminal_error"} and not recovery:
+    sizes = [450000] * 6 if mode != "large_page_image" else [3100000]
+    for size in sizes:
+        print(json.dumps({"type": "user", "message": {"content": [{"type": "tool_result",
+            "tool_use_id": "offline-image", "content": [{"type": "image", "source": {
+                "type": "base64", "media_type": "image/png", "data": "A" * size}}]}]}}), flush=True)
+    if mode == "page_images_terminal_error":
+        print(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True}), flush=True)
+        raise SystemExit(0)
+
 def answer(verdict, result):
     progress = "NONE: repeated search" if result == "none" else "NEW: " + result
     report = f"""CHECKPOINT
@@ -121,7 +131,10 @@ elif mode == "stalled":
 elif mode == "disagree":
     answer("DISAGREE", "substantive continuing result")
 else:
-    answer("DISAGREE" if recovery and mode != "oversize" else "AGREE", "checkpoint exercised")
+    if mode == "page_images_terminal_error":
+        print(json.dumps({"type": "result", "subtype": "error_max_turns", "is_error": True}), flush=True)
+    else:
+        answer("DISAGREE" if recovery and mode != "oversize" else "AGREE", "checkpoint exercised")
 '''
 
 
@@ -277,6 +290,16 @@ def main():
 
         success, _, _ = run_case(root, fake_bin, "success", "success")
         assert "Run completed" in success
+
+        for image_mode in ("page_images", "large_page_image"):
+            image_progress, image_rows, image_transcript = run_case(root, fake_bin, image_mode, image_mode)
+            assert "CONSENSUS REACHED" in image_transcript and "invalid report" not in image_progress
+            assert sum(len(row.get("line", "").encode("utf-8")) for row in image_rows) > 2_000_000
+            assert "image/png" in "".join(row.get("line", "") for row in image_rows)
+        error_progress, _, error_transcript = run_case(
+            root, fake_bin, "images-terminal-error", "page_images_terminal_error", expected_code=1,
+        )
+        assert "terminal failure" in error_progress and "CONSENSUS REACHED" not in error_transcript
 
         claude_log = root / "latest-claude.jsonl"
         codex_log = root / "latest-codex.jsonl"

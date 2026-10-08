@@ -589,6 +589,92 @@ class ReportValidationTests(RunnerCase):
 
 
 class TerminalStreamTests(RunnerCase):
+    def test_many_image_events_do_not_consume_semantic_capture(self):
+        monitor = mock.Mock()
+        observer = self.helper("stream_observer")("Claude", monitor)
+        image = {"type": "user", "message": {"content": [{"type": "image",
+            "source": {"type": "base64", "media_type": "image/png", "data": "A" * 450000}}]}}
+        wire = json.dumps(image) + "\n"
+        for _ in range(6):
+            for offset in range(0, len(wire), 65536):
+                observer("stdout", wire[offset:offset + 65536])
+        self.assertGreater(len(wire) * 6, self.runner.CAPTURE_MAX_BYTES)
+        self.assertEqual(observer.collected_stdout(), "")
+        monitor.observe.assert_not_called()
+        for event in (assistant_event(report()), terminal_event(result=report())):
+            observer("stdout", json.dumps(event) + "\n")
+        _, answer = self.helper("claude_answer")(observer.collected_stdout())
+        self.assertEqual(answer, report())
+        self.assert_report_valid(answer)
+
+    def test_single_image_larger_than_old_capture_limit_is_supported(self):
+        observer = self.helper("stream_observer")("Claude")
+        wire = json.dumps({"type": "user", "content": [{"type": "image",
+            "source": {"type": "base64", "data": "A" * 3100000}}]}) + "\n"
+        for offset in range(0, len(wire), 65536):
+            observer("stdout", wire[offset:offset + 65536])
+        self.assertEqual(observer.event_bytes, 0)
+        self.assertEqual(observer.fragments, [])
+        self.assertEqual(observer.collected_stdout(), "")
+
+    def test_code_execution_and_mcp_payloads_do_not_consume_codex_capture(self):
+        observer = self.helper("stream_observer")("Codex", session={})
+        for kind in ("command_execution", "mcp_tool_call"):
+            wire = json.dumps({"type": "item.completed", "item": {
+                "type": kind, "result": {"image": "A" * 1100000}}}) + "\n"
+            for offset in range(0, len(wire), 65536):
+                observer("stdout", wire[offset:offset + 65536])
+        self.assertEqual(observer.collected_stdout(), "")
+
+    def test_superseded_reports_do_not_accumulate_in_memory(self):
+        observer = self.helper("stream_observer")("Claude")
+        for index in range(60):
+            observer("stdout", json.dumps(assistant_event(str(index) + "x" * 39000)) + "\n")
+        self.assertLess(len(observer.collected_stdout().encode()), 40000)
+        self.assertIn("59", observer.collected_stdout())
+
+    def test_thinking_and_tool_only_messages_preserve_last_text_without_crediting_it_again(self):
+        monitor = mock.Mock()
+        observer = self.helper("stream_observer")("Claude", monitor)
+        for event in (assistant_event(report()),
+                      {"type": "assistant", "message": {"content": [
+                          {"type": "thinking", "thinking": "bounded diagnostic"}]}},
+                      {"type": "assistant", "message": {"content": [
+                          {"type": "tool_use", "name": "Read", "input": {}}]}},
+                      terminal_event()):
+            observer("stdout", json.dumps(event) + "\n")
+        thinking, answer = self.helper("claude_answer")(observer.collected_stdout())
+        self.assertEqual(thinking, "bounded diagnostic")
+        self.assertEqual(answer, report())
+        monitor.observe.assert_called_once()
+
+    def test_malformed_text_is_not_erased_by_later_valid_report(self):
+        observer = self.helper("stream_observer")("Claude")
+        for event in (assistant_event(42), assistant_event(report()), terminal_event(result=report())):
+            observer("stdout", json.dumps(event) + "\n")
+        with self.assertRaisesRegex(RuntimeError, "terminal failure"):
+            self.helper("claude_answer")(observer.collected_stdout())
+
+    def test_single_event_guard_is_independent_of_report_capture(self):
+        observer = self.helper("stream_observer")("Claude")
+        with mock.patch.object(self.runner, "EVENT_MAX_BYTES", 4096):
+            with self.assertRaisesRegex(RuntimeError, "individual JSON event"):
+                observer("stdout", json.dumps({"type": "user", "data": "A" * 8192}) + "\n")
+
+    def test_semantic_report_capture_guard_remains_enforced(self):
+        observer = self.helper("stream_observer")("Claude")
+        with self.assertRaisesRegex(RuntimeError, "semantic report capture"):
+            observer("stdout", json.dumps(assistant_event("x" * 2100000)) + "\n")
+
+    def test_terminal_error_remains_sticky_after_media_and_later_success(self):
+        observer = self.helper("stream_observer")("Claude")
+        events = [assistant_event(report()), terminal_event(is_error=True, subtype="error_max_turns"),
+                  {"type": "user", "data": "A" * 1100000}, terminal_event(result=report())]
+        for event in events:
+            observer("stdout", json.dumps(event) + "\n")
+        with self.assertRaisesRegex(RuntimeError, "terminal failure"):
+            self.helper("claude_answer")(observer.collected_stdout())
+
     def extract(self, events, returncode=0):
         stream = "\n".join(json.dumps(event) for event in events) + "\n"
         with mock.patch.object(self.runner, "_run_streaming",

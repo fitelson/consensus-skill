@@ -133,6 +133,9 @@ truncate the answer. Failed compression does not make an overlong report valid.
   and resumed research tranches and synthesis; default 42000.
 - `--claude-tranche-think TOKENS`: per-call thinking cap; default 7000.
 - `--checkpoint-deadline SECS`: semantic interval in ACTIVE work; default 900.
+- `--stream-max-bytes N`: raw transport/disk budget per call, including media;
+  default 64000000. Media is journaled, not counted as returned-report capture.
+- `--event-max-bytes N`: individual JSON-event parsing budget; default 8000000.
 - `--claude-report-deadline SECS`: shared stream-activity interval compatibility
   option; default 300, with five consecutive silent intervals.
   The older `--claude-timeout` spelling is an alias.

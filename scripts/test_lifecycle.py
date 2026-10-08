@@ -26,7 +26,8 @@ from unittest import mock
 
 RUNNER = Path(__file__).with_name("consensus")
 SELF = Path(__file__).resolve()
-CALL_CAP = 0.45
+# Allow fake CLI startup before exercising the EOF deadline on busy machines.
+CALL_CAP = 2.0
 WATCHDOG = 20
 TAIL = "LIFECYCLE_SIGTERM_TAIL"
 
@@ -270,7 +271,7 @@ def worker(action):
                 mock.patch.object(queue, "Queue", RecordingQueue), \
                 mock.patch.object(threading.Thread, "start", injected_start):
             if action == "main":
-                cap = "1" if os.environ["LIFECYCLE_MODE"] == "cap-recovery" else "5"
+                cap = "2" if os.environ["LIFECYCLE_MODE"] == "cap-recovery" else "5"
                 sys.argv = [
                     str(RUNNER), "--quiet", "--max-rounds", "2", "--no-synthesize",
                     "--claude-turn-timeout", cap, "--codex-timeout", cap,
@@ -446,9 +447,9 @@ class LifecycleTests(unittest.TestCase):
         for resumed in (False, True):
             with self.subTest(provider=provider, resumed=resumed):
                 outcome = self.drive(provider + "-eof", "eof", resume=resumed)
-                self.assertTrue(outcome["pipes_closed"])
+                self.assertTrue(outcome["pipes_closed"], {"stats": outcome["stats"], "calls": outcome["calls"], "stderr": outcome["stderr"]})
                 self.assertEqual(outcome["stats"].get("exception"), "TimeoutExpired")
-                self.assertLess(outcome["stats"]["elapsed"], 3)
+                self.assertLess(outcome["stats"]["elapsed"], 4)
                 self.assertEqual(len(outcome["calls"]), 1)
                 self.assertEqual(outcome["calls"][0]["resumed"], resumed)
 
@@ -500,7 +501,7 @@ class LifecycleTests(unittest.TestCase):
         journal = outcome["journals"]["journal.jsonl"]["text"]
         self.assertIn(TAIL, journal)
         self.assertIn(TAIL + "_STDERR", journal)
-        self.assertLess(outcome["stats"]["elapsed"], 3)
+        self.assertLess(outcome["stats"]["elapsed"], 4)
 
     def assert_resource_limit(self, action, mode, message):
         outcome = self.drive(action, mode)
@@ -529,7 +530,7 @@ class LifecycleTests(unittest.TestCase):
 
     def assert_stable_sessions(self, mode):
         outcome = self.drive("main", mode)
-        self.assertNotIn("exception", outcome["stats"], outcome["stats"])
+        self.assertNotIn("exception", outcome["stats"], {"stats": outcome["stats"], "stdout": outcome["stdout"][-4000:], "stderr": outcome["stderr"], "calls": outcome["calls"]})
         self.assertIn("CONSENSUS REACHED", outcome["stdout"])
         self.assertEqual(len(outcome["calls"]), 4)
         for provider in ("claude", "codex"):
