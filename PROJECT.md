@@ -216,4 +216,21 @@ participants, recovery without sub-agents, sub-agent text never becoming a
 checkpoint or report, the manifest field, and rejection of negative counts.
 With the stream filter removed, the sub-agent case fails. The full offline gate
 passed: main suite, 93 hardening tests, 15 lifecycle tests, syntax, skill
-metadata, and whitespace. No live debate with sub-agents has been run.
+metadata, and whitespace.
+
+October 8, 2026 live acceptance run of `--subagents 2 --max-rounds 2`, at the
+maintainer's request. It used the default models and a three-part
+computational question. The debate reached consensus in 5m 30s: Claude
+DISAGREE, then Codex AGREE, then Claude AGREE, then synthesis. The agreed
+answers were correct.
+- Claude checkpointed its plan, then launched two foreground `general-purpose`
+  sub-agents on `claude-opus-5-5`. Each Claude call ended with exactly one
+  `result`, and the observer ignored 20 sub-agent stream messages.
+- Codex made two `spawn_agent` calls and one `wait_agent` call. Its rollouts
+  show two depth-1 sub-agents on `gpt-6.1-sol`/`xhigh`.
+- There were no missed semantic deadlines, invalid reports, silent intervals,
+  or recovery calls. The manifest recorded
+  `research_subagents_per_participant: 2`.
+
+This is a single short run. It does not exercise a sub-agent batch long enough
+to approach the semantic checkpoint deadline.
