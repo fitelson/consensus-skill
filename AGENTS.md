@@ -25,7 +25,7 @@ When changing the runner:
   900 seconds of ACTIVE work, including report-only recovery and excluding only
   peer waits/idle time; stop after two consecutive missed semantic deadlines,
   separate from the 300-second/five-silent-interval call cutoff;
-- retain the common 900-second live-call cap and bounded 120-second recovery;
+- retain the common 1800-second live-call cap and bounded 300-second recovery;
 - validate completed reports from both participants and synthesis; two adjacent
   completed `DISAGREE`/`NONE` reports from either side stall the exchange,
   while substantive progress resets the stall count;

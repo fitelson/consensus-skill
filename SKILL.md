@@ -42,8 +42,8 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Read
   waits/idle time. Recovery has the same six-field requirement.
 - Stream activity is separate: check every 300 seconds; five consecutive silent
   intervals cut off the live call. Traffic resets silence, not semantic misses.
-- Every live research/synthesis call has an independent 900-second cap by
-  default. Recovery resumes the same session within a bounded 120 seconds,
+- Every live research/synthesis call has an independent 1800-second cap by
+  default. Recovery resumes the same session within a bounded 300 seconds,
   without new research or tools. A cap or transport failure is not `DISAGREE`.
 - Each completed report begins with one coherent six-field `CHECKPOINT` and
   requires a nonempty answer and literal final-line `VERDICT: AGREE` or
@@ -58,8 +58,8 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Read
   plus `VERDICT: AGREE`, validated before stripping controls for display.
   Bounded same-session recovery precedes fallback to a substantive agreed answer.
 
-The default live-call cap can fire before the other monitors; it does not
-replace them. Prompts and context go through stdin. All waits stay bounded after
+The default live-call cap is independent of the other monitors, which can stop
+a call first; it does not replace them. Prompts and context go through stdin. All waits stay bounded after
 EOF, and repeated cancellation must not interrupt owned process-group cleanup.
 
 Research, recovery, compression, and synthesis all forbid recursive consensus,
@@ -140,10 +140,10 @@ truncate the answer. Failed compression does not make an overlong report valid.
   option; default 300, with five consecutive silent intervals.
   The older `--claude-timeout` spelling is an alias.
 - `--claude-recovery-timeout SECS`: bounded same-session report-recovery
-  deadline; default 120; Claude recovery disables thinking.
+  deadline; default 300; Claude recovery disables thinking.
 - `--claude-turn-timeout SECS`: common live-call cap compatibility option;
-  default 900 for both participants; activity never resets it.
-- `--codex-timeout SECS`: default 900; positive only and capped by the common
+  default 1800 for both participants; activity never resets it.
+- `--codex-timeout SECS`: default 1800; positive only and capped by the common
   live-call limit. Zero is invalid.
 - `--save FILE`: atomic Markdown transcript path.
 - `--progress FILE`: fsynced Markdown event log path.

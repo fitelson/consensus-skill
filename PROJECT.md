@@ -48,11 +48,11 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Preserve these properties:
 5. Independently check stream activity every 300 seconds by default. Five
    consecutive silent intervals cut off the live call; activity resets only
    that silence counter.
-6. Cap every live research or synthesis call for either participant at 900
+6. Cap every live research or synthesis call for either participant at 1800
    seconds by default, without resetting on activity. `--claude-turn-timeout`
    remains the compatibility option for the common cap; `--codex-timeout`
-   defaults to 900, must be positive, and cannot exceed the common cap.
-7. Use bounded same-session report recovery, at most 120 seconds by default,
+   defaults to 1800, must be positive, and cannot exceed the common cap.
+7. Use bounded same-session report recovery, at most 300 seconds by default,
    without new research or tool use. Claude recovery disables thinking.
    Transport failure is not a semantic `DISAGREE` verdict.
 8. Validate one coherent completed report: its final complete six-field
@@ -179,3 +179,12 @@ the runner's own stop. New regressions:
 Against the pre-fix runner the tree-kill case reproduces the incident: one
 recovery call, an `invalid report` entry, and exit 0. With the fix it exits
 130 after a single provider call.
+
+October 8, 2026 default change, at the maintainer's request: the common
+live-call cap (`--claude-turn-timeout`, `--codex-timeout`) now defaults to
+1800 seconds instead of 900. A Codex `xhigh` research turn on a hard proof
+task hit the 900-second cap and its 120-second recovery, aborting the run.
+The same-session report-recovery cap (`--claude-recovery-timeout`) now
+defaults to 300 seconds instead of 120, also at the maintainer's request.
+The semantic checkpoint interval (900 s) and the stream-silence monitor
+(300 s x 5) are unchanged.

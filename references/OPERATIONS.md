@@ -85,15 +85,16 @@ refers to stream activity.
 
 ### Live-call and recovery limits
 
-Every live research or synthesis call for either participant is capped at 900
+Every live research or synthesis call for either participant is capped at 1800
 seconds by default, regardless of ongoing activity. The legacy
 `--claude-turn-timeout` option configures this common cap. `--codex-timeout`
-defaults to 900, must be positive, and is capped by the common live-call limit;
+defaults to 1800, must be positive, and is capped by the common live-call limit;
 zero does not mean unlimited.
 
-With defaults, this call cap can fire before two semantic misses or five silent
-intervals. It is a separate cutoff, not an implementation of either stop rule.
-After a call cutoff, same-session report recovery is bounded to 120 seconds by
+With defaults, five silent intervals (1500 seconds) or two missed semantic
+deadlines (1800 seconds of ACTIVE work) can stop a call before or together with
+this cap. It is a separate cutoff, not an implementation of either stop rule.
+After a call cutoff, same-session report recovery is bounded to 300 seconds by
 default (`--claude-recovery-timeout`). Recovery performs no new research or
 tool use; Claude recovery disables thinking. Do not turn a transport error
 into an invented `DISAGREE` verdict.

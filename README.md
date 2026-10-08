@@ -133,10 +133,10 @@ Run `consensus --help` for the complete CLI reference. Important options are:
 - `--claude-report-deadline SECS`: compatibility name for the shared stream
   activity interval; default 300, with five consecutive silent intervals;
 - `--claude-recovery-timeout SECS`: bounded same-session report-recovery
-  deadline; default 120; Claude recovery disables thinking;
+  deadline; default 300; Claude recovery disables thinking;
 - `--claude-turn-timeout SECS`: compatibility name for the common non-resettable
-  live research/synthesis call cap; default 900 for both participants;
-- `--codex-timeout SECS`: Codex live-call deadline; default 900, positive only,
+  live research/synthesis call cap; default 1800 for both participants;
+- `--codex-timeout SECS`: Codex live-call deadline; default 1800, positive only,
   capped by the common live-call limit; zero is invalid;
 - `--overwrite`: explicitly allow existing output reuse; never permits
   artifact collisions or unsafe symlink redirection;
@@ -160,12 +160,14 @@ Three independent monitors apply to both participants:
   Ordinary stream traffic is not a semantic checkpoint.
 - Stream liveness: check activity every 300 seconds; five consecutive silent
   intervals cut off the live call. New activity resets only the silence count.
-- Live-call cap: stop each research or synthesis call after 900 seconds by
+- Live-call cap: stop each research or synthesis call after 1800 seconds by
   default, even if it keeps streaming. Resume the same session for bounded
-  120-second report recovery, with no new research or tools.
+  300-second report recovery, with no new research or tools.
 
-The default live-call cap can fire before two semantic misses or five silent
-intervals; it does not replace either rule or reset semantic state. Normal
+The default live-call cap is a separate cutoff: with defaults, five silent
+intervals (1500 seconds) or two missed semantic deadlines (1800 seconds of
+ACTIVE work) can stop a call first. The cap does not replace either rule or
+reset semantic state. Normal
 unfinished work resumes the same research session at the next tranche.
 
 Every completed participant report must begin with exactly one six-field

@@ -27,8 +27,8 @@ For every behavioral change:
 - apply protocol version 3 equally: six-field semantic checkpoints at least
   every 900 seconds of ACTIVE work, including report-only recovery and excluding
   only peer waits/idle time; stop after two consecutive missed semantic deadlines;
-- keep the separate 300-second/five-silent-interval monitor, common 900-second
-  live-call cap, and bounded 120-second recovery;
+- keep the separate 300-second/five-silent-interval monitor, common 1800-second
+  live-call cap, and bounded 300-second recovery;
 - require coherent completed checkpoint/verdict reports from both participants;
   two adjacent completed `DISAGREE`/`NONE` reports from either side stall, and
   substantive progress resets the count;
