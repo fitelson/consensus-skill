@@ -24,6 +24,20 @@ per run. Refuse existing outputs unless `--overwrite` explicitly authorizes
 reuse. That flag does not permit collisions, symlink redirection, or unrelated
 file replacement.
 
+Reservation creates every new output exclusively and compares actual device/
+inode identities before replacing any authorized existing artifact. This catches
+case-variant names that alias only after creation on case-insensitive APFS.
+Read-only existing modes that cannot preserve owner-write permission are rejected
+before clearing any previous content. Failed reservations can leave new empty
+private files; they are retained, not automatically deleted.
+
+Authorized existing outputs are cleared through their held verified descriptors,
+and changed pathname identities are rejected. Multiply-linked existing outputs
+are refused so descriptor clearing cannot erase an unlisted hardlink. Ordinary
+later publication is still pathname-based: cooperating users/tools must not
+rename or replace active artifacts. These checks do not isolate uncoordinated
+same-user filesystem mutation.
+
 The runner owns the open journal descriptors and fsyncs timestamped read chunks
 from both participants' stdout/stderr. Each JSONL record contains `timestamp`,
 `stream`, `line`, and `raw_b64`; `line` holds decoded chunk text, not necessarily a complete
@@ -134,11 +148,11 @@ Reject other values or trailing material. Validate terminal completion/error
 events too: a successful process exit alone does not make an intermediate
 assistant report eligible for convergence.
 
-Release boundary to verify: the provider report extractors currently strip
-outer report whitespace before validation. This can erase spaces after the
-final verdict even though the verdict parser itself is literal. The exact
-format above is the required protocol; end-to-end whitespace rejection must
-be checked through extraction, not only by testing the verdict helper.
+Provider extractors preserve outer verdict whitespace; end-to-end tests reject
+leading/trailing spaces through both assistant fallback and terminal-result
+extraction. Canonical `NONE` and `NEW:` tokens are case-sensitive. A body made
+only of protocol controls is not substantive, including a second verdict line
+left over after stripping the final verdict. Substantive text may quote controls.
 
 The six fields also define live semantic checkpoints. A completed response must
 still pass report validation even if the stream was active throughout the call.
@@ -163,27 +177,38 @@ Recovery/compression additionally forbids new research and tool calls.
 
 Sub-agents are forbidden by default (`--subagents 0`). With `--subagents N`,
 each participant's research tranches may run up to N concurrent sub-agents.
-Recovery, compression, and synthesis never receive them. The manifest records
+Recovery, compression, and synthesis explicitly disable native delegation.
+The manifest records
 `research_subagents_per_participant`.
 
 - Claude uses the Agent tool. The runner sets
-  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for those calls. A background
+  `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` for every phase. A background
   sub-agent would let `claude -p` emit an interim result, end the turn, and
   resume later, which breaks the one-completed-report contract. Foreground
   sub-agents inherit the participant's model. Claude Code has no CLI cap on
   the number of sub-agents, so N is a prompt instruction for Claude.
+  When N=0 (including recovery and synthesis), `--disallowedTools Agent,Task`
+  also denies the current native tool and its legacy alias.
 - Codex uses `spawn_agent`/`wait_agent`. The runner passes
   `features.multi_agent=true`, `agents.max_concurrent_threads_per_session=N`,
   and `agents.max_depth=1`. Codex itself refuses an extra concurrent spawn
   ("agent thread limit reached"). Sub-agents inherit the session's model and
   effort, and their events do not appear in the parent's `exec --json` stream.
+  Each fresh/resumed N-positive research call gets these controls. N=0 calls
+  explicitly set `features.multi_agent=false`, overriding an enabled default.
 - Claude sub-agent events do appear in the stream, tagged with
   `parent_tool_use_id`. They stay in the raw journal but are ignored for
   checkpoints and reports: only top-level messages count.
+  Tagged result/error frames are ignored too, without weakening root errors.
 - Sub-agent time counts against the same semantic checkpoint, stream-activity,
   and live-call clocks. The prompt asks for a checkpoint before and after each
   sub-agent batch and for tasks expected to finish within 10 minutes. A
   participant blocked on a sub-agent cannot emit its own checkpoint.
+
+These are native capability controls and prompt policy, not a security sandbox.
+All phases prohibit recursive debates/other model calls by prompt. Recovery and
+compression prohibit new research and tools by prompt; synthesis permits
+ordinary tools. Shell/MCP access does not establish complete model-call isolation.
 
 ## Consensus and synthesis
 
@@ -249,6 +274,20 @@ groups get SIGKILL two seconds after SIGTERM instead of five. This keeps cleanup
 inside a supervisor's own escalation window. Interrupted runs exit 130 with an
 `INTERRUPTED` transcript.
 
+If stopping begins during ordinary cleanup, the five-second deadline is
+shortened to two seconds from the original SIGTERM timestamp. Shutdown is checked
+again after cleanup, before accepting a report, and before terminal publication.
+Concurrent research I/O failures yield interruption when a stop is pending,
+matching synthesis. The shared interrupted finalizer tries both progress and
+transcript writes and returns 130 even if persistence fails; stderr records
+that limitation.
+
+The completion boundary is `seal_completion()` immediately before final
+transcript/progress publication. It rejects any already-latched stop; after the
+boundary, later signals do not cancel the committed terminal decision. Console
+agreement may appear earlier, before synthesis: terminal status is determined
+by the transcript outcome, progress entry, and exit code, not a success phrase.
+
 Provider calls retain only bounded report/control data in memory (2,000,000
 bytes), not the entire incoming stream. Input images, tool results, partial
 messages, signatures, and stderr stay in the private disk journal. Each JSON
@@ -268,7 +307,13 @@ Claude/Codex wrappers use filtered streaming instead.
 
 The reader queue holds at most 64 chunks, each at most 65,536 bytes (64 KiB).
 After process cleanup, the final tail-drain loop has a five-second budget and
-fsyncs retained chunks. Pending tail data beyond that budget or the raw-stream
+fsyncs retained chunks while bypassing only an already-failed observer, so a
+parser failure cannot abort raw retention. Healthy control parsing remains active
+during drain, preserving queued session IDs and checkpoints for targeted recovery;
+the failed semantic-stop latch still cannot be reset by late checkpoints.
+Nonregular Codex output paths are opened
+nonblocking/no-follow and rejected before reading, avoiding FIFO open hangs.
+Pending tail data beyond that budget or the raw-stream
 guard is not guaranteed to be retained; this is bounded recovery, not an
 unlimited lossless-capture guarantee. Deliberately escaped process groups and
 provider-side session durability are outside the local owned-group guarantee.
@@ -353,13 +398,19 @@ Required regression areas include:
   cleanup, termination-tail persistence, and bounded backlog handling;
 - collisions, aliases, symlinks, output refusal/explicit overwrite, unique
   temporary files, private-mode preservation, and crash-durable writes;
+- fresh native case aliases, validation/reservation races, read-only overwrite
+  refusal without prior-content loss, FIFO output rejection, and late stop/I/O
+  precedence with coherent interruption outcomes;
 - fixed model/effort defaults, overrides, no default documentation fetch,
   provenance, and strict frontmatter metadata fixtures;
 - no recursive/delegation instructions in every phase and size-guard
   compression instead of blind truncation;
 - sub-agents forbidden by default; with `--subagents N`, research-only Claude
   foreground enforcement and Codex concurrency/depth flags, none in recovery,
-  and sub-agent stream messages never accepted as checkpoints or reports.
+  and sub-agent stream messages never accepted as checkpoints or reports;
+- native delegation controls on every fresh/resumed research call, positive-N
+  synthesis and recovery; ambient background-disable settings must not break
+  the offline gate.
 
 Tests must use temporary fake CLIs, not live providers or charged model calls.
 Offline tests do not certify provider-side session storage, arbitrary semantic

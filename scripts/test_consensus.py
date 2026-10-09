@@ -89,6 +89,8 @@ if call_log:
 
 if is_synthesis and mode == "synthesis_success":
     plain("Mock synthesis success.")
+elif is_synthesis and mode == "synthesis_control_only":
+    plain("VERDICT: DISAGREE")
 elif is_synthesis and mode == "synthesis_recover" and not recovery:
     time.sleep(20)
 elif is_synthesis and mode == "synthesis_recover" and recovery:
@@ -433,11 +435,13 @@ def main():
         # Sub-agents stay forbidden unless a run opts in with --subagents N.
         default_claude = json.loads((root / "latest-claude.jsonl").read_text().splitlines()[0])
         default_codex = json.loads((root / "latest-codex.jsonl").read_text().splitlines()[0])
-        assert default_claude["background_disabled"] is None
+        assert default_claude["background_disabled"] == "1"
+        assert default_claude["argv"][default_claude["argv"].index("--disallowedTools") + 1] == "Agent,Task"
         assert default_claude["forbids_subagents"] and not default_claude["subagent_rule"]
         assert not default_codex["subagent_rule"]
-        assert not any(arg.startswith(("agents.", "features.multi_agent"))
-                       for arg in default_codex["argv"])
+        assert "features.multi_agent=false" in default_codex["argv"]
+        assert "features.multi_agent=true" not in default_codex["argv"]
+        assert not any(arg.startswith("agents.") for arg in default_codex["argv"])
         assert json.loads((root / "latest-high-defaults.progress.md.protocol.json")
                           .read_text())["research_subagents_per_participant"] == 0
 
@@ -452,6 +456,7 @@ def main():
         sub_codex = json.loads(codex_log.read_text().splitlines()[0])
         assert sub_claude["background_disabled"] == "1"
         assert sub_claude["subagent_rule"] and not sub_claude["forbids_subagents"]
+        assert "--disallowedTools" not in sub_claude["argv"]
         assert sub_codex["subagent_rule"]
         for flag in ("features.multi_agent=true",
                      "agents.max_concurrent_threads_per_session=3", "agents.max_depth=1"):
@@ -477,10 +482,54 @@ def main():
         claude_calls = [json.loads(line) for line in claude_log.read_text().splitlines()]
         codex_calls = [json.loads(line)["argv"] for line in codex_log.read_text().splitlines()]
         assert claude_calls[0]["background_disabled"] == "1"
-        assert claude_calls[1]["background_disabled"] is None
+        assert claude_calls[1]["background_disabled"] == "1"
+        assert claude_calls[1]["argv"][claude_calls[1]["argv"].index("--disallowedTools") + 1] == "Agent,Task"
         assert "agents.max_concurrent_threads_per_session=2" in codex_calls[0]
         assert "resume" in codex_calls[1]
         assert not any(arg.startswith("agents.") for arg in codex_calls[1])
+        assert "features.multi_agent=false" in codex_calls[1]
+        assert "features.multi_agent=true" not in codex_calls[1]
+
+        # Audit C8: enforce the flags on every ordinary resumed research tranche.
+        claude_log = root / "subagents-rounds-claude.jsonl"
+        codex_log = root / "subagents-rounds-codex.jsonl"
+        run_case(root, fake_bin, "subagents-rounds", "disagree", max_rounds=3,
+                 extra_args=["--subagents", "3"],
+                 extra_env={"FAKE_CLAUDE_CALL_LOG": str(claude_log),
+                            "FAKE_CODEX_CALL_LOG": str(codex_log)})
+        claude_calls = [json.loads(line) for line in claude_log.read_text().splitlines()]
+        codex_calls = [json.loads(line) for line in codex_log.read_text().splitlines()]
+        assert len(claude_calls) == len(codex_calls) == 3
+        for index, call in enumerate(claude_calls):
+            assert call["background_disabled"] == "1" and call["subagent_rule"]
+            assert "--disallowedTools" not in call["argv"]
+            assert ("--resume" in call["argv"]) == (index > 0)
+        for index, call in enumerate(codex_calls):
+            assert call["subagent_rule"]
+            assert ("resume" in call["argv"]) == (index > 0)
+            for flag in ("features.multi_agent=true", "agents.max_concurrent_threads_per_session=3",
+                         "agents.max_depth=1"):
+                assert flag in call["argv"]
+            assert "features.multi_agent=false" not in call["argv"]
+
+        # Positive-N research must not leak native delegation into synthesis.
+        claude_log = root / "subagents-synthesis-claude.jsonl"
+        codex_log = root / "subagents-synthesis-codex.jsonl"
+        synth_progress, _, _ = run_case(
+            root, fake_bin, "subagents-synthesis", "synthesis_success", synthesize=True,
+            extra_args=["--subagents", "3"],
+            extra_env={"FAKE_CLAUDE_CALL_LOG": str(claude_log),
+                       "FAKE_CODEX_CALL_LOG": str(codex_log)},
+        )
+        assert "Claude synthesis completed" in synth_progress
+        calls = [json.loads(line) for line in claude_log.read_text().splitlines()]
+        research = [call for call in calls if not call["synthesis"]]
+        synth = [call for call in calls if call["synthesis"]]
+        assert research and len(synth) == 1
+        assert all("--disallowedTools" not in call["argv"] for call in research)
+        assert synth[0]["background_disabled"] == "1"
+        assert synth[0]["argv"][synth[0]["argv"].index("--disallowedTools") + 1] == "Agent,Task"
+        assert not synth[0]["subagent_rule"]
 
         rejected = subprocess.run([str(RUNNER), "--subagents", "-1", "--no-save", "q"],
                                   capture_output=True, text=True)
@@ -617,6 +666,13 @@ def main():
         assert "synthesis recovery failed" in dissent_progress
         agreed_body = dissent_transcript.split("## Agreed answer", 1)[1].split("## Claude", 1)[0]
         assert "Mock Codex report." in agreed_body and "I reject" not in agreed_body
+
+        control_progress, _, control_transcript = run_case(
+            root, fake_bin, "synthesis-control-only", "synthesis_control_only", synthesize=True,
+        )
+        assert "synthesis recovery failed" in control_progress
+        agreed_body = control_transcript.split("## Agreed answer", 1)[1].split("## Claude", 1)[0]
+        assert "Mock Codex report." in agreed_body and "VERDICT: DISAGREE" not in agreed_body
 
         compression, _, compressed = run_case(root, fake_bin, "compressed-report", "oversize")
         assert "byte delivery limit" in compression

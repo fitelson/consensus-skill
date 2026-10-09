@@ -31,6 +31,9 @@ When changing the runner:
   while substantive progress resets the stall count;
 - reserve disjoint artifact paths, refuse existing outputs without explicit
   `--overwrite`, use unique exclusive temporary files, and preserve private modes;
+- reserve native identities exclusively before clearing old artifacts, reject
+  incompatible read-only modes, and keep interruption status/progress/transcript
+  coherent through provider cleanup and the terminal completion boundary;
 - request reports of at most 40,000 output tokens and use the conservative
   40,000-UTF-8-byte delivery guard to request compression, never blind truncation;
 - add or update offline regression tests for behavioral changes; include both
@@ -45,6 +48,11 @@ compression, and synthesis. Sub-agents stay forbidden unless a run passes
 to expand the task. The retained OpenAI metadata helper validates only a narrow
 frontmatter mapping; do not describe it as general YAML validation or default
 discovery. The legacy Claude table helper is separate.
+
+Disable native delegation when forbidden (Codex multi_agent=false and Claude
+Agent/Task denied); every Claude call disables background tasks. These controls
+do not isolate shell access or certify semantic truth. Keep recovery/compression
+research and tool prohibitions explicit without asking for new file creation.
 
 Use `apply_patch` for source edits. Preserve unrelated work and do not delete
 anything without explicit approval. Run every command in the `Verification`

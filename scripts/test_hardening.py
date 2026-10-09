@@ -104,6 +104,14 @@ class RunnerCase(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="consensus-hardening-")
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name)
+        state = self.runner._SHUTDOWN
+        saved = dict(state)
+
+        def restore_shutdown():
+            state.clear()
+            state.update(saved)
+        self.addCleanup(restore_shutdown)
+        state.update({"requested": False, "signal": None, "completed": False})
 
     def helper(self, name):
         function = getattr(self.runner, name, None)
@@ -296,8 +304,13 @@ class ArtifactPathTests(RunnerCase):
     def test_explicit_overwrite_allows_regular_file_without_mutating_it(self):
         existing = self.paths()[0]
         existing.write_text("previous transcript", encoding="utf-8")
+        existing.chmod(0o640)
+        before = existing.stat()
         self.helper("validate_artifact_paths")(self.paths(), overwrite=True)
         self.assertEqual(existing.read_text(), "previous transcript")
+        after = existing.stat()
+        self.assertEqual((after.st_ino, after.st_mode, after.st_mtime_ns),
+                         (before.st_ino, before.st_mode, before.st_mtime_ns))
         self.assertEqual(list(self.root.iterdir()), [existing])
 
     def test_hardlink_collision_rejected_even_with_overwrite(self):
@@ -366,6 +379,181 @@ class ArtifactPathTests(RunnerCase):
         with self.assertRaises(ValueError):
             self.helper("validate_artifact_paths")((directory,), overwrite=True)
         self.assertTrue(directory.is_dir())
+
+
+class ArtifactReservationTests(RunnerCase):
+    def test_new_reservations_are_empty_and_private_under_permissive_umask(self):
+        paths = tuple(self.root / name for name in (
+            "report.md", "progress.md", "claude.jsonl", "codex.jsonl", "protocol.json",
+        ))
+        previous = os.umask(0)
+        try:
+            self.helper("reserve_artifacts")(paths)
+        finally:
+            os.umask(previous)
+        for path in paths:
+            self.assertTrue(path.is_file())
+            self.assertEqual(path.read_bytes(), b"")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_overwrite_clears_authorized_files_and_preserves_owner_write(self):
+        old = self.root / "old.md"
+        new = self.root / "new.md"
+        old.write_text("previous report", encoding="utf-8")
+        old.chmod(0o640)
+        self.helper("reserve_artifacts")((old, new), overwrite=True)
+        for path in (old, new):
+            self.assertEqual(path.read_bytes(), b"")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_existing_output_without_overwrite_preserves_all_content(self):
+        new = self.root / "new.md"
+        old = self.root / "old.md"
+        old.write_text("previous report", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.helper("reserve_artifacts")((new, old))
+        self.assertFalse(new.exists())
+        self.assertEqual(old.read_text(), "previous report")
+
+    def test_readonly_last_output_fails_preflight_before_any_mutation(self):
+        old, new, readonly = (self.root / name for name in (
+            "old.md", "new.md", "readonly.md",
+        ))
+        old.write_text("previous report", encoding="utf-8")
+        old.chmod(0o640)
+        readonly.write_text("preserve readonly report", encoding="utf-8")
+        for mode in (0o400, 0o440, 0o444, 0o460):
+            with self.subTest(mode=oct(mode)):
+                readonly.chmod(mode)
+                with self.assertRaises(ValueError):
+                    self.helper("reserve_artifacts")((old, new, readonly), overwrite=True)
+                self.assertFalse(new.exists())
+                self.assertEqual(old.read_text(), "previous report")
+                self.assertEqual(stat.S_IMODE(old.stat().st_mode), 0o640)
+                self.assertEqual(readonly.read_text(), "preserve readonly report")
+                self.assertEqual(stat.S_IMODE(readonly.stat().st_mode), mode)
+
+    def require_native_case_aliases(self):
+        probe = self.root / "CaSeProbe"
+        probe.write_text("case probe", encoding="utf-8")
+        if not (self.root / "caseprobe").exists():
+            self.skipTest("fixture filesystem is case-sensitive")
+        self.assertTrue(os.path.samefile(probe, self.root / "caseprobe"))
+
+    def test_native_case_aliases_never_clear_prior_output(self):
+        self.require_native_case_aliases()
+        old = self.root / "old.md"
+        first, alias = self.root / "Report.md", self.root / "report.md"
+        old.write_text("previous report", encoding="utf-8")
+        old.chmod(0o640)
+        with self.assertRaises((OSError, ValueError)):
+            self.helper("reserve_artifacts")((old, first, alias), overwrite=True)
+        self.assertEqual(old.read_text(), "previous report")
+        self.assertEqual(stat.S_IMODE(old.stat().st_mode), 0o640)
+        if first.exists():
+            self.assertTrue(os.path.samefile(first, alias))
+            self.assertEqual(first.read_bytes(), b"")
+            self.assertEqual(stat.S_IMODE(first.stat().st_mode), 0o600)
+
+    def test_native_case_input_alias_is_rejected_without_clearing_outputs(self):
+        self.require_native_case_aliases()
+        source, alias = self.root / "Question.txt", self.root / "question.txt"
+        old = self.root / "old.md"
+        source.write_text("private question", encoding="utf-8")
+        old.write_text("previous report", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            self.helper("reserve_artifacts")(
+                (old, alias), input_paths=(source,), overwrite=True,
+            )
+        self.assertEqual(source.read_text(), "private question")
+        self.assertEqual(old.read_text(), "previous report")
+
+    def test_file_appearing_at_exclusive_open_preserves_prior_and_reserved_files(self):
+        old = self.root / "old.md"
+        new_paths = (self.root / "first.md", self.root / "second.md")
+        old.write_text("previous report", encoding="utf-8")
+        old.chmod(0o640)
+        real_open = self.runner.os.open
+        attempts = []
+
+        # Fail the second exclusive reservation so the first must survive.
+        def raced_open(path, flags, *args, **kwargs):
+            if flags & os.O_EXCL and Path(path) in new_paths:
+                attempts.append(Path(path))
+                if len(attempts) == 2:
+                    descriptor = real_open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o640)
+                    try:
+                        os.write(descriptor, b"another writer owns this")
+                        os.fchmod(descriptor, 0o640)
+                    finally:
+                        os.close(descriptor)
+            return real_open(path, flags, *args, **kwargs)
+
+        with mock.patch.object(self.runner.os, "open", side_effect=raced_open):
+            with self.assertRaises((OSError, ValueError)):
+                self.helper("reserve_artifacts")((old, *new_paths), overwrite=True)
+        self.assertEqual(len(attempts), 2, "new paths were not reserved exclusively")
+        reserved, raced = attempts
+        self.assertEqual(reserved.read_bytes(), b"", "created reservation was removed")
+        self.assertEqual(stat.S_IMODE(reserved.stat().st_mode), 0o600)
+        self.assertEqual(raced.read_text(), "another writer owns this")
+        self.assertEqual(stat.S_IMODE(raced.stat().st_mode), 0o640)
+        self.assertEqual(old.read_text(), "previous report")
+        self.assertEqual(stat.S_IMODE(old.stat().st_mode), 0o640)
+
+    def test_file_appearing_after_validation_is_not_implicitly_overwritten(self):
+        old, raced = self.root / "old.md", self.root / "raced.md"
+        old.write_text("previous report", encoding="utf-8")
+        old.chmod(0o640)
+        real_validate = self.helper("validate_artifact_paths")
+        injected = []
+
+        def validate_then_race(*args, **kwargs):
+            result = real_validate(*args, **kwargs)
+            if not injected:
+                raced.write_text("another writer owns this", encoding="utf-8")
+                raced.chmod(0o640)
+                injected.append(True)
+            return result
+
+        with mock.patch.object(self.runner, "validate_artifact_paths", side_effect=validate_then_race):
+            with self.assertRaises((OSError, ValueError)):
+                self.helper("reserve_artifacts")((old, raced), overwrite=True)
+        self.assertEqual(injected, [True])
+        self.assertEqual(raced.read_text(), "another writer owns this")
+        self.assertEqual(stat.S_IMODE(raced.stat().st_mode), 0o640)
+        self.assertEqual(old.read_text(), "previous report")
+        self.assertEqual(stat.S_IMODE(old.stat().st_mode), 0o640)
+
+    def test_late_path_swap_cannot_clear_a_new_regular_occupant(self):
+        old = self.root / "old.md"
+        moved = self.root / "authorized-old.md"
+        old.write_text("authorized old output", encoding="utf-8")
+        real_truncate = self.runner.os.ftruncate
+        raced = []
+
+        def swap_before_truncate(descriptor, size):
+            if not raced:
+                old.rename(moved)
+                old.write_text("unrelated new occupant", encoding="utf-8")
+                raced.append(True)
+            return real_truncate(descriptor, size)
+
+        with mock.patch.object(self.runner.os, "ftruncate", side_effect=swap_before_truncate):
+            with self.assertRaisesRegex(ValueError, "changed during clearing"):
+                self.helper("reserve_artifacts")((old,), overwrite=True)
+        self.assertEqual(raced, [True])
+        self.assertEqual(old.read_text(), "unrelated new occupant")
+        self.assertEqual(moved.read_bytes(), b"", "only the authorized descriptor may be cleared")
+
+    def test_unlisted_hardlink_is_rejected_before_authorized_reset(self):
+        old, other = self.root / "old.md", self.root / "unlisted.txt"
+        old.write_text("must preserve other link", encoding="utf-8")
+        os.link(old, other)
+        with self.assertRaisesRegex(ValueError, "multiply-linked"):
+            self.helper("reserve_artifacts")((old,), overwrite=True)
+        self.assertEqual(old.read_text(), "must preserve other link")
+        self.assertEqual(other.read_text(), "must preserve other link")
 
 
 class StructuredMetadataTests(RunnerCase):
@@ -465,6 +653,8 @@ class CheckpointTests(RunnerCase):
             "no new result", "unchanged",
             "NEW", "NEW:", "NEW:   ", "NONE:", "NONE:   ",
             "MAYBE: fact", "true", "some facts", "NONEISH", "NEWNESS: fact",
+            "none", "none: repeated search", "None", "None: repeated search",
+            "new: verified fact", "New: verified fact", "nEw: verified fact",
         ):
             with self.subTest(value=value):
                 self.assertIsNone(self.helper("checkpoint_of")(checkpoint(value)))
@@ -509,6 +699,27 @@ class ReportValidationTests(RunnerCase):
                      report(body=" \n\t")):
             with self.subTest(text=text):
                 self.assert_report_invalid(text)
+
+    def test_protocol_only_bodies_are_rejected_for_reports_and_synthesis(self):
+        for body in (
+            "VERDICT: AGREE", "VERDICT: DISAGREE", "VERDICT: MAYBE",
+            "VERDICT: AGREE\nVERDICT: DISAGREE",
+            "  CHECKPOINT\n\tEND CHECKPOINT\n  VERDICT: AGREE  ",
+        ):
+            for synthesis in (False, True):
+                with self.subTest(body=body, synthesis=synthesis):
+                    self.assert_report_invalid(report(body=body), synthesis=synthesis)
+
+    def test_substantive_body_may_quote_verdict_examples(self):
+        for body in (
+            'The literal protocol example is "VERDICT: AGREE"; the counterexample was checked.',
+            "The examples are protocol syntax, not the evidence:\n"
+            "VERDICT: DISAGREE\nVERDICT: AGREE\n" + ANSWER,
+            "The checked conclusion is quoted below.\n> VERDICT: AGREE",
+        ):
+            for synthesis in (False, True):
+                with self.subTest(body=body, synthesis=synthesis):
+                    self.assert_report_valid(report(body=body), synthesis=synthesis)
 
     def test_report_body_strips_checkpoint_and_verdict(self):
         self.assertEqual(self.helper("report_body")(report()), ANSWER)
@@ -591,6 +802,90 @@ class ReportValidationTests(RunnerCase):
 
 
 class TerminalStreamTests(RunnerCase):
+    def claude_views(self, events):
+        monitor, checkpoint_report = mock.Mock(), mock.Mock()
+        observer = self.helper("stream_observer")(
+            "Claude", monitor=monitor, checkpoint_report=checkpoint_report,
+        )
+        wire = "".join(json.dumps(event) + "\n" for event in events)
+        for offset in range(0, len(wire), 31):
+            observer("stdout", wire[offset:offset + 31])
+        return (wire, observer.collected_stdout()), observer, monitor, checkpoint_report
+
+    def test_tagged_success_cannot_complete_root_assistant_report(self):
+        views, observer, monitor, callback = self.claude_views([
+            assistant_event(report()),
+            terminal_event(result=report(), parent_tool_use_id="child-agent"),
+        ])
+        for index, stream in enumerate(views):
+            with self.subTest(view=index):
+                with self.assertRaisesRegex(RuntimeError, "no successful completed report"):
+                    self.helper("claude_answer")(stream)
+        self.assertFalse(observer.terminal_error)
+        monitor.observe.assert_called_once()
+        callback.assert_called_once()
+
+    def test_all_tagged_child_frames_are_ignored_without_checkpoint_credit(self):
+        child = assistant_event(report())
+        child["parent_tool_use_id"] = "child-agent"
+        malformed = assistant_event(42)
+        malformed["parent_tool_use_id"] = "child-agent"
+        views, observer, monitor, callback = self.claude_views([
+            child, malformed,
+            terminal_event(result=report(), parent_tool_use_id="child-agent"),
+            terminal_event(is_error=True, subtype="error_max_turns", parent_tool_use_id="child-agent"),
+            {"type": "error", "parent_tool_use_id": "child-agent"},
+        ])
+        self.assertEqual(views[1], "")
+        self.assertFalse(observer.terminal_error)
+        monitor.observe.assert_not_called()
+        callback.assert_not_called()
+        with self.assertRaisesRegex(RuntimeError, "no successful completed report"):
+            self.helper("claude_answer")(views[0])
+
+    def test_tagged_results_and_errors_cannot_replace_or_poison_root_completion(self):
+        child_report = report(body="A child-only claim.", verdict="DISAGREE")
+        for child in (
+            terminal_event(result=child_report, parent_tool_use_id="child-agent"),
+            terminal_event(is_error=True, subtype="error_max_turns", parent_tool_use_id="child-agent"),
+            terminal_event(subtype="error_during_execution", parent_tool_use_id="child-agent"),
+            {"type": "error", "parent_tool_use_id": "child-agent"},
+        ):
+            with self.subTest(child=child):
+                views, observer, monitor, callback = self.claude_views([
+                    child, assistant_event(report()), terminal_event(result=report()), child,
+                ])
+                for stream in views:
+                    self.assertEqual(self.helper("claude_answer")(stream), ("", report()))
+                self.assertFalse(observer.terminal_error)
+                monitor.observe.assert_called_once()
+                callback.assert_called_once()
+
+    def test_root_error_remains_sticky_across_child_and_root_success(self):
+        views, observer, _, _ = self.claude_views([
+            assistant_event(report()), {"type": "error"},
+            terminal_event(result=report(), parent_tool_use_id="child-agent"),
+            terminal_event(result=report()),
+        ])
+        self.assertTrue(observer.terminal_error)
+        for stream in views:
+            with self.assertRaisesRegex(RuntimeError, "terminal failure"):
+                self.helper("claude_answer")(stream)
+
+    def test_empty_parent_tag_does_not_hide_root_completion(self):
+        for tag in (None, ""):
+            with self.subTest(tag=tag):
+                message = assistant_event(report())
+                message["parent_tool_use_id"] = tag
+                views, observer, monitor, callback = self.claude_views([
+                    message, terminal_event(result=report(), parent_tool_use_id=tag),
+                ])
+                for stream in views:
+                    self.assertEqual(self.helper("claude_answer")(stream), ("", report()))
+                self.assertFalse(observer.terminal_error)
+                monitor.observe.assert_called_once()
+                callback.assert_called_once()
+
     def test_many_image_events_do_not_consume_semantic_capture(self):
         monitor = mock.Mock()
         observer = self.helper("stream_observer")("Claude", monitor)
@@ -832,6 +1127,67 @@ class CodexSessionTests(RunnerCase):
         self.assertEqual(session, {"id": self.ORIGINAL_ID})
 
 
+class ProviderControlTests(RunnerCase):
+    def test_claude_always_disables_background_and_denies_agents_only_at_zero(self):
+        for subagents in (0, 2):
+            for think_budget in (0, 7000):
+                with self.subTest(subagents=subagents, think_budget=think_budget):
+                    stream = json.dumps(terminal_event(result=report())) + "\n"
+                    with mock.patch.dict(os.environ, {"CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "0"}), \
+                            mock.patch.object(self.runner, "_run_streaming", return_value=(0, stream, "")) as run:
+                        self.assertEqual(self.helper("run_claude")(
+                            "offline fixture", think_budget, timeout=1, subagents=subagents,
+                        ), ("", report()))
+                    command, environment, _ = run.call_args.args
+                    self.assertEqual(environment["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"], "1")
+                    if subagents == 0:
+                        self.assertEqual(command[command.index("--disallowedTools") + 1], "Agent,Task")
+                    else:
+                        self.assertNotIn("--disallowedTools", command)
+                    self.assertEqual(command[command.index("--model") + 1], self.runner.CLAUDE_MODEL)
+                    self.assertEqual(command[command.index("--effort") + 1], self.runner.CLAUDE_EFFORT)
+                    self.assertEqual(run.call_args.kwargs["stdin_text"], "offline fixture")
+
+    def test_codex_explicit_agent_feature_and_limits_for_fresh_and_resumed_calls(self):
+        identity = CodexSessionTests.ORIGINAL_ID
+
+        def completed_stream(command, _environment, _timeout, **kwargs):
+            Path(command[command.index("-o") + 1]).write_text(report(), encoding="utf-8")
+            events = [
+                {"type": "thread.started", "thread_id": identity},
+                {"type": "item.completed", "item": {"type": "agent_message", "text": report()}},
+                {"type": "turn.completed"},
+            ]
+            for event in events:
+                kwargs["text_observer"]("stdout", json.dumps(event) + "\n")
+            return 0, "", ""
+
+        for subagents in (0, 2):
+            for resumed in (False, True):
+                with self.subTest(subagents=subagents, resumed=resumed):
+                    session = {"id": identity} if resumed else {}
+                    with mock.patch.object(self.runner, "_run_streaming", side_effect=completed_stream) as run:
+                        self.assertEqual(self.helper("run_codex")(
+                            "offline fixture", session=session, timeout=1, subagents=subagents,
+                        ), report())
+                    command = run.call_args.args[0]
+                    configs = [command[index + 1] for index, value in enumerate(command)
+                               if value == "--config"]
+                    enabled = "true" if subagents else "false"
+                    self.assertIn("features.multi_agent=" + enabled, configs)
+                    self.assertEqual(sum(value.startswith("features.multi_agent=") for value in configs), 1)
+                    if subagents:
+                        self.assertIn("agents.max_concurrent_threads_per_session=2", configs)
+                        self.assertIn("agents.max_depth=1", configs)
+                    else:
+                        self.assertFalse(any(value.startswith("agents.") for value in configs))
+                    self.assertEqual(command[command.index("--model") + 1], self.runner.CODEX_MODEL)
+                    self.assertIn(f'model_reasoning_effort="{self.runner.CODEX_REASONING_EFFORT}"', configs)
+                    self.assertEqual("resume" in command, resumed)
+                    self.assertEqual(session["id"], identity)
+                    self.assertEqual(run.call_args.kwargs["stdin_text"], "offline fixture")
+
+
 class FixedDefaultsTests(RunnerCase):
     def test_defaults_match_latest_human_authorization(self):
         self.assertEqual(self.runner.DEFAULT_CLAUDE_MODEL, "claude-opus-5-5")
@@ -1054,17 +1410,58 @@ class ShutdownLatchTests(RunnerCase):
     def setUp(self):
         super().setUp()
         self.helper("shutdown_requested")
-        state = self.runner._SHUTDOWN
-        saved = dict(state)
         handlers = {s: signal.getsignal(s) for s in self.runner.TERMINATION_SIGNALS}
 
-        def restore():
-            state.clear()
-            state.update(saved)
+        def restore_handlers():
             for s, handler in handlers.items():
                 signal.signal(s, handler)
-        self.addCleanup(restore)
-        state.update({"requested": False, "signal": None})
+        self.addCleanup(restore_handlers)
+
+    def test_completion_rejects_preboundary_signals_without_clearing_stop(self):
+        for signum in self.runner.TERMINATION_SIGNALS:
+            with self.subTest(signum=signum):
+                self.runner._SHUTDOWN.update({"requested": False, "signal": None, "completed": False})
+                self.runner._latch_shutdown(signum)
+                with self.assertRaises(self.runner.ShutdownRequested):
+                    self.helper("seal_completion")()
+                self.assertFalse(self.runner._SHUTDOWN["completed"])
+                self.assertTrue(self.runner.shutdown_requested())
+                self.assertEqual(self.runner._SHUTDOWN["signal"], signum)
+                self.runner._latch_shutdown(signal.SIGTERM)
+                self.assertEqual(self.runner._SHUTDOWN["signal"], signum)
+
+    def test_sealed_completion_ignores_all_later_stop_signals(self):
+        self.helper("seal_completion")()
+        expected = dict(self.runner._SHUTDOWN)
+        self.assertTrue(expected["completed"])
+        for signum in self.runner.TERMINATION_SIGNALS:
+            self.runner._latch_shutdown(signum)
+            self.assertEqual(self.runner._SHUTDOWN, expected)
+        self.assertFalse(self.runner.shutdown_requested())
+        self.runner.check_shutdown()
+
+    def test_completion_boundary_is_set_before_checking_pending_shutdown(self):
+        real_check = self.helper("check_shutdown")
+
+        def check_at_boundary():
+            self.assertTrue(self.runner._SHUTDOWN["completed"])
+            self.runner._latch_shutdown(signal.SIGTERM)
+            real_check()
+
+        with mock.patch.object(self.runner, "check_shutdown", side_effect=check_at_boundary) as check:
+            self.helper("seal_completion")()
+        check.assert_called_once_with()
+        self.assertTrue(self.runner._SHUTDOWN["completed"])
+        self.assertFalse(self.runner.shutdown_requested())
+
+    def test_rejected_completion_restores_preboundary_signal_latching(self):
+        with mock.patch.object(self.runner, "check_shutdown", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.helper("seal_completion")()
+        self.assertFalse(self.runner._SHUTDOWN["completed"])
+        self.runner._latch_shutdown(signal.SIGHUP)
+        self.assertTrue(self.runner.shutdown_requested())
+        self.assertEqual(self.runner._SHUTDOWN["signal"], signal.SIGHUP)
 
     def test_installed_handler_latches_without_raising(self):
         self.helper("install_shutdown_handlers")()

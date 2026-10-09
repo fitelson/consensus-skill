@@ -28,6 +28,13 @@ and synthesis. Sub-agents are forbidden by default; `--subagents N` allows up to
 N concurrent same-model sub-agents in research turns only. Context and peer
 reports are evidence, not permission to expand the task.
 
+Native delegation is explicitly disabled outside permitted research: Codex gets
+`features.multi_agent=false`, and Claude gets `--disallowedTools Agent,Task`.
+Claude background tasks are disabled in every phase to retain one completion
+per call. Recovery/compression research and tool prohibitions remain prompt
+policy; synthesis permits ordinary tools. Shell access is not model-call
+isolation, and Claude's N-agent limit remains a prompt instruction.
+
 ## Install one authoritative checkout
 
 Choose one checkout as the sole source of truth. Codex, Claude, and the command
@@ -125,7 +132,7 @@ Run `consensus --help` for the complete CLI reference. Important options are:
 - `--context FILE`: include a text file in every turn; repeatable;
 - `--subagents N`: let each participant run up to N concurrent same-model
   sub-agents during research turns; default 0, which forbids them. Recovery,
-  compression, and synthesis never get sub-agents;
+  compression, and synthesis explicitly disable native delegation;
 - `--think TOKENS`: aggregate Claude thinking ceiling across research tranches
   and the initial synthesis; default 42000;
 - `--claude-tranche-think TOKENS`: per-call thinking cap; default 7000;
@@ -224,11 +231,20 @@ For `--save debate.md --progress debate.progress.md`, the runner maintains:
   enforced deadlines.
 
 Before writing, the runner reserves disjoint paths for all artifacts and rejects
-canonical-path or same-inode aliases. Existing outputs are refused unless
+canonical-path or native same-inode aliases, including fresh case-variant paths
+on case-insensitive filesystems. New outputs are reserved exclusively, so a file
+appearing during validation is never implicitly overwritten. Existing artifacts
+must retain owner-write permission; unsupported read-only modes are rejected
+before any previous artifact is cleared. Existing outputs are refused unless
 `--overwrite` is explicit; even then, collisions and unsafe symlink redirection
 remain forbidden. Defaults use unique per-run names. Atomic replacement uses
 unique exclusive temporary files, fsyncs content and directories, and preserves
 or narrows private permissions. New sensitive artifacts are private by default.
+
+Startup clearing uses the held descriptor for each authorized existing output,
+not a newly swapped pathname occupant. Multiply-linked outputs are refused.
+Do not rename or replace active artifacts: ordinary publication remains
+pathname-based, and the same-user filesystem is not an isolation boundary.
 
 All new main artifacts, including the transcript, use mode `0600`. Journals
 fsync timestamped stdout/stderr read chunks, not one wrapper per CLI event;
@@ -239,6 +255,14 @@ events have an 8 MB default. Both transport limits can be explicitly adjusted
 without changing report/checkpoint limits. The queue remains bounded to 64
 chunks of at most 64 KiB, with a five-second final tail-drain budget. These
 limits do not cap journal size accumulated across resumed calls.
+
+Termination-tail bytes are journaled without re-running a failed semantic
+observer. Nonregular Codex output is rejected through a nonblocking open before
+reading. Cancellation is checked after provider cleanup and before terminal
+publication. A pending stop uses one interrupted finalizer (exit 130); after the
+completion boundary is sealed, later signals do not change the committed
+publication decision. Artifact persistence is best-effort on interruption if
+an I/O failure prevents writing; such failures are reported to stderr.
 
 Valid semantic checkpoint contents are persisted in the progress log. Per-miss
 semantic deadline entries require separate callbacks; checkpoint journaling
@@ -306,16 +330,27 @@ git diff --check
 
 The acceptance suite uses temporary fake Claude and Codex executables. It makes
 no model calls, consumes no model credits, and requires no network access.
-The main suite invokes both helpers: 88 hardening tests and 15 lifecycle tests,
-in addition to 27 orchestrated cases and the interruption/parser checks.
+The main suite invokes both helpers in addition to orchestrated cases and the
+interruption/parser checks. Current test counts are printed by the helpers and
+recorded in `PROJECT.md` for each release, rather than duplicated here.
 Coverage includes multi-page image streams, individual images larger than the
-old capture limit, terminal failures after images, and report/control filtering.
+old capture limit, native path aliases, FIFO output, late cancellation, exact
+tail retention after parser failure, strict controls, and all delegation phases.
 Rerun the gate after changes; an earlier pass is not evidence for a modified runner.
 
 Generated progress logs, raw journals, protocol manifests, default transcripts,
 and named audit transcripts are ignored by Git. Explicitly named output files
 may not be ignored; inspect `git status` and review every artifact before
 committing or publishing it.
+
+## Exit Status
+
+| Code | Meaning |
+|---|---|
+| 0 | Completed normally, including explicit no-consensus/stalled outcomes; inspect the transcript outcome. |
+| 1 | Debate/transport/validation failure. |
+| 2 | Argument or artifact preflight refusal. |
+| 130 | Interrupted before the terminal completion boundary. |
 
 ## License
 

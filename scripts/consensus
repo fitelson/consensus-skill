@@ -33,7 +33,7 @@ import textwrap
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from urllib.request import Request, urlopen
 from datetime import datetime
@@ -156,7 +156,7 @@ def resolve_models():
             "selection_policy": "Defaults: Opus 5.5 and GPT 6.1 Sol; extra-high effort; explicit overrides honored",
             "models": selections}
 
-CLAUDE_REPORT_DEADLINE = 300  # durable-work checkpoint interval
+CLAUDE_REPORT_DEADLINE = 300  # shared stream-activity interval, not semantic checkpoints
 CLAUDE_TRANCHE_THINK = 7000  # max extended-thinking tokens in one Claude tranche
 CLAUDE_RECOVERY_TIMEOUT = 300
 CLAUDE_MAX_CONSECUTIVE_MISSES = 5
@@ -338,7 +338,7 @@ class SilentIntervalsExceeded(subprocess.TimeoutExpired):
 
 
 class DebateStalled(RuntimeError):
-    """Two completed Claude turns made no substantive progress."""
+    """Two adjacent completed participant reports made no substantive progress."""
 
 
 class StreamLimitExceeded(RuntimeError):
@@ -357,7 +357,7 @@ class ProviderSignaled(RuntimeError):
 # handler can land inside queue/threading lock internals and surface as an
 # unrelated RuntimeError ("release unlocked lock"), which the turn loop would
 # misread as an invalid report and answer with a fresh recovery call.
-_SHUTDOWN = {"requested": False, "signal": None}
+_SHUTDOWN = {"requested": False, "signal": None, "completed": False}
 TERMINATION_SIGNALS = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
 SIGNALED_EXIT_CODES = {128 + int(s) for s in TERMINATION_SIGNALS}
 PROVIDER_SIGNAL_GRACE = 1.0  # wait for our own copy of a process-tree signal
@@ -365,6 +365,8 @@ SHUTDOWN_TERM_GRACE = 2.0  # SIGTERM-to-SIGKILL escalation once stopping
 
 
 def _latch_shutdown(signum, _frame=None):
+    if _SHUTDOWN.get("completed"):
+        return
     if _SHUTDOWN["signal"] is None:
         _SHUTDOWN["signal"] = signum
     _SHUTDOWN["requested"] = True
@@ -386,6 +388,16 @@ def shutdown_requested(wait=0.0):
 def check_shutdown():
     if _SHUTDOWN["requested"]:
         raise ShutdownRequested("termination requested")
+
+
+def seal_completion():
+    """Linearize terminal publication after honoring every already-latched stop."""
+    _SHUTDOWN["completed"] = True
+    try:
+        check_shutdown()
+    except KeyboardInterrupt:
+        _SHUTDOWN["completed"] = False
+        raise
 
 
 def termination_pending(error):
@@ -484,9 +496,14 @@ def _terminate_group(proc, pgid):
         pass
     # Once stopping, escalate sooner so cleanup finishes inside a supervisor's
     # own SIGTERM-to-SIGKILL window.
-    deadline = time.monotonic() + (SHUTDOWN_TERM_GRACE if shutdown_requested() else 5)
+    term_started = time.monotonic()
+    deadline = term_started + (SHUTDOWN_TERM_GRACE if shutdown_requested() else 5)
     proc.poll()
     while _group_alive(pgid) and time.monotonic() < deadline:
+        if shutdown_requested():
+            deadline = min(deadline, term_started + SHUTDOWN_TERM_GRACE)
+            if time.monotonic() >= deadline:
+                break
         proc.poll()
         time.sleep(0.05)
     if _group_alive(pgid):
@@ -545,8 +562,13 @@ def validate_artifact_paths(paths, input_paths=(), overwrite=False):
             raise ValueError("Artifact paths collide")
         identities.add(identity)
         if os.path.lexists(path):
-            if not stat.S_ISREG(os.lstat(path).st_mode) or not overwrite:
+            metadata = os.lstat(path)
+            if not stat.S_ISREG(metadata.st_mode) or not overwrite:
                 raise ValueError("Existing artifact requires --overwrite: " + path)
+            if not metadata.st_mode & stat.S_IWUSR:
+                raise ValueError("Artifact replacement must preserve owner write permission: " + path)
+            if metadata.st_nlink != 1:
+                raise ValueError("Refusing multiply-linked artifact (possible input alias): " + path)
         for other in paths:
             if other == path:
                 continue
@@ -563,12 +585,61 @@ def validate_artifact_paths(paths, input_paths=(), overwrite=False):
 
 def private_open(path, *, exclusive=False):
     flags = os.O_WRONLY | os.O_CREAT | (os.O_EXCL if exclusive else os.O_APPEND)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
     descriptor = os.open(path, flags, 0o600)
     if not stat.S_ISREG(os.fstat(descriptor).st_mode):
         os.close(descriptor)
         raise ValueError("Artifact must be a regular file")
     return os.fdopen(descriptor, "a", encoding="utf-8")
+
+
+def reserve_artifacts(paths, input_paths=(), overwrite=False):
+    """Reserve native file identities before replacing any authorized output."""
+    paths = [os.path.abspath(path) for path in paths if path]
+    existing = {path: os.lstat(path) for path in paths if os.path.lexists(path)}
+    validate_artifact_paths(paths, input_paths, overwrite)
+    identities = set()
+    reserved_identities = {}
+    handles = {}
+    with ExitStack() as reservations:
+        for path in paths:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if path in existing:
+                handle = reservations.enter_context(private_open(path))
+            else:
+                # Never turn an unexpected file appearance into implicit overwrite.
+                handle = reservations.enter_context(private_open(path, exclusive=True))
+            metadata = os.fstat(handle.fileno())
+            identity = (metadata.st_dev, metadata.st_ino)
+            prior = existing.get(path)
+            if prior and identity != (prior.st_dev, prior.st_ino):
+                raise ValueError("Artifact changed during reservation: " + path)
+            if identity in identities:
+                raise ValueError("Artifact paths collide on the native filesystem")
+            identities.add(identity)
+            reserved_identities[path] = identity
+            handles[path] = handle
+            handle.flush()
+            os.fsync(handle.fileno())
+        validate_artifact_paths(paths, input_paths, overwrite=True)
+        for path in paths:
+            current = os.lstat(path)
+            if (current.st_dev, current.st_ino) != reserved_identities[path]:
+                raise ValueError("Artifact changed during reservation: " + path)
+        for path in existing:
+            handle = handles[path]
+            metadata = os.fstat(handle.fileno())
+            if metadata.st_nlink != 1:
+                raise ValueError("Artifact gained an unrelated hardlink during reservation: " + path)
+            # Clear the authorized object, never a new occupant of its pathname.
+            os.fchmod(handle.fileno(), 0o600 & stat.S_IMODE(metadata.st_mode))
+            os.ftruncate(handle.fileno(), 0)
+            os.fsync(handle.fileno())
+            current = os.lstat(path)
+            if (current.st_dev, current.st_ino) != reserved_identities[path]:
+                raise ValueError("Artifact changed during clearing: " + path)
+    for path in paths:
+        _fsync_directory(path)
 
 
 def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
@@ -592,6 +663,7 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
     misses = 0
     closed = set()
     leader_cleaned = False
+    observer_error = None
 
     def put(item):
         while not stop.is_set():
@@ -613,7 +685,7 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
             pipe.close()
 
     def consume(name, chunk, *, capture=True):
-        nonlocal captured, streamed, last_activity
+        nonlocal captured, streamed, last_activity, observer_error
         if chunk is None:
             closed.add(name)
             return
@@ -638,8 +710,13 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
                 output[name].append(text)
             elif capture:
                 raise StreamLimitExceeded("captured stream exceeded byte limit")
-        if text_observer and (not capture_output or captured < CAPTURE_MAX_BYTES):
-            text_observer(name, text)
+        if text_observer and observer_error is None and (not capture_output or captured < CAPTURE_MAX_BYTES):
+            try:
+                text_observer(name, text)
+            except BaseException as error:
+                observer_error = error
+                if capture:
+                    raise
 
     try:
         if semantic_monitor:
@@ -699,36 +776,42 @@ def _run_streaming(cmd, env, timeout, *, stdin_text=None, checkpoint_file=None,
         # Cancellation is deferred through cleanup and the final tail flush.
         with deferred_interrupts():
             error = sys.exc_info()[1]
-            if proc:
-                _terminate_process_group(proc, proc.pid)
-            flush_deadline = time.monotonic() + 5
             try:
-                while time.monotonic() < flush_deadline:
-                    try:
-                        name, chunk = events.get(timeout=0.05)
-                        consume(name, chunk, capture=False)
-                    except queue.Empty:
-                        if all(not thread.is_alive() for thread in threads):
-                            break
-            finally:
-                stop.set()
-                for thread in threads:
-                    thread.join(timeout=0.2)
                 if proc:
-                    for pipe in (proc.stdin, proc.stdout, proc.stderr):
-                        if pipe is not None and not pipe.closed:
-                            pipe.close()
-                if journal:
-                    try:
-                        journal.flush()
-                        os.fsync(journal.fileno())
-                    finally:
-                        journal.close()
-            if isinstance(error, subprocess.TimeoutExpired):
-                error.output = "".join(output["stdout"])
-                error.stderr = "".join(output["stderr"])
-            if semantic_monitor:
-                semantic_monitor.last_time = None
+                    _terminate_process_group(proc, proc.pid)
+                flush_deadline = time.monotonic() + 5
+                try:
+                    while time.monotonic() < flush_deadline:
+                        try:
+                            name, chunk = events.get(timeout=0.05)
+                            consume(name, chunk, capture=False)
+                        except queue.Empty:
+                            if all(not thread.is_alive() for thread in threads):
+                                break
+                finally:
+                    stop.set()
+                    for thread in threads:
+                        thread.join(timeout=0.2)
+                    if proc:
+                        for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                            if pipe is not None and not pipe.closed:
+                                pipe.close()
+                    if journal:
+                        try:
+                            journal.flush()
+                            os.fsync(journal.fileno())
+                        finally:
+                            journal.close()
+                if isinstance(error, subprocess.TimeoutExpired):
+                    error.output = "".join(output["stdout"])
+                    error.stderr = "".join(output["stderr"])
+            finally:
+                if semantic_monitor:
+                    semantic_monitor.last_time = None
+                # A successful return can otherwise hide a signal received in cleanup.
+                check_shutdown()
+                if error is None and observer_error is not None:
+                    raise observer_error
 
 
 class StreamObserver:
@@ -775,11 +858,10 @@ class StreamObserver:
         report = ""
         message_id = None
         if self.provider == "Claude":
-            if kind not in {"assistant", "result", "error"}:
+            # Child controls remain private diagnostics, never parent reports.
+            if event.get("parent_tool_use_id"):
                 return
-            # Sub-agent messages carry their parent Agent call's id. They stay in
-            # the raw journal but are never this participant's checkpoint or report.
-            if kind == "assistant" and event.get("parent_tool_use_id"):
+            if kind not in {"assistant", "result", "error"}:
                 return
             if kind == "error":
                 self.terminal_error = True
@@ -883,11 +965,13 @@ def claude_answer(stdout):
             continue
         if not isinstance(obj, dict):
             raise RuntimeError("invalid Claude event object")
+        if obj.get("parent_tool_use_id"):
+            continue
         kind = obj.get("type")
         if kind == "error" or (kind == "result" and (
                 obj.get("is_error") or str(obj.get("subtype", "")).startswith("error"))):
             raise RuntimeError("Claude reported terminal failure")
-        if kind == "assistant" and not obj.get("parent_tool_use_id"):
+        if kind == "assistant":
             message = obj.get("message")
             blocks = message.get("content") if isinstance(message, dict) else None
             if not isinstance(blocks, list):
@@ -919,10 +1003,8 @@ def run_claude(prompt, think_budget, timeout=None, *, session_id=None,
                stream_journal=None, semantic_monitor=None, checkpoint_report=None,
                subagents=0):
     env = dict(os.environ)
-    if subagents > 0:
-        # A background sub-agent lets `claude -p` return an interim report and
-        # resume later; foreground-only agents keep one completed report per call.
-        env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
+    # Keep every phase single-completion even if an unintended agent is attempted.
+    env["CLAUDE_CODE_DISABLE_BACKGROUND_TASKS"] = "1"
     if think_budget > 0:
         env["MAX_THINKING_TOKENS"] = str(think_budget)
         env.pop("CLAUDE_CODE_DISABLE_THINKING", None)
@@ -931,6 +1013,8 @@ def run_claude(prompt, think_budget, timeout=None, *, session_id=None,
         env.pop("MAX_THINKING_TOKENS", None)
     cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose",
            "--include-partial-messages", "--model", CLAUDE_MODEL, "--effort", CLAUDE_EFFORT]
+    if subagents == 0:
+        cmd.extend(["--disallowedTools", "Agent,Task"])
     env["CLAUDE_CODE_EFFORT_LEVEL"] = CLAUDE_EFFORT
     if session_id:
         cmd.extend(["--resume" if resume else "--session-id", session_id])
@@ -944,13 +1028,14 @@ def run_claude(prompt, think_budget, timeout=None, *, session_id=None,
         semantic_monitor=semantic_monitor,
         capture_output=False,
     )
+    check_shutdown()
     if code:
         raise provider_exit_error("claude", code)
     return claude_answer(stdout or observer.collected_stdout())
 
 
 def checkpoint_of(text):
-    """Return a validated Claude checkpoint mapping, or None."""
+    """Return a validated participant checkpoint mapping, or None."""
     lines = text.splitlines()
     try:
         start = max(i for i, line in enumerate(lines) if line == "CHECKPOINT")
@@ -970,7 +1055,7 @@ def checkpoint_of(text):
         fields[key.strip()] = value.strip()
     if any(not fields.get(field) for field in CHECKPOINT_FIELDS):
         return None
-    if not re.fullmatch(r"NONE(?::\s*.+)?|NEW:\s*.+", fields["new_results"], re.I):
+    if not re.fullmatch(r"NONE(?::\s*.+)?|NEW:\s*.+", fields["new_results"]):
         return None
     return fields
 
@@ -1007,6 +1092,8 @@ def run_codex(prompt, *, session=None, timeout=None, stream_journal=None,
             cmd.extend(["--config", "features.multi_agent=true",
                         "--config", f"agents.max_concurrent_threads_per_session={subagents}",
                         "--config", "agents.max_depth=1"])
+        else:
+            cmd.extend(["--config", "features.multi_agent=false"])
         if session.get("id"):
             cmd.extend([session["id"], "-"])
         observer = stream_observer("Codex", semantic_monitor, checkpoint_report, session,
@@ -1020,6 +1107,7 @@ def run_codex(prompt, *, session=None, timeout=None, stream_journal=None,
             semantic_monitor=semantic_monitor,
             capture_output=False,
         )
+        check_shutdown()
         if code:
             raise provider_exit_error("codex", code)
         stdout = stdout or observer.collected_stdout()
@@ -1037,7 +1125,8 @@ def run_codex(prompt, *, session=None, timeout=None, stream_journal=None,
                 completed = True
         if not completed or not session.get("id"):
             raise RuntimeError("Codex returned no successful resumable completion")
-        descriptor = os.open(out.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        descriptor = os.open(out.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                             | getattr(os, "O_NONBLOCK", 0))
         with os.fdopen(descriptor, "rb") as result:
             metadata = os.fstat(result.fileno())
             if not stat.S_ISREG(metadata.st_mode):
@@ -1082,7 +1171,10 @@ def validate_report(text, synthesis=False):
         raise ValueError("Report exceeds conservative UTF-8 byte delivery limit")
     cp = checkpoint_of(text)
     verdict = verdict_of(text)
-    if not cp or not verdict or not report_body(text):
+    body = report_body(text)
+    substantive = any(line.strip() and not re.fullmatch(
+        r"CHECKPOINT|END CHECKPOINT|VERDICT:.*", line.strip()) for line in body.splitlines())
+    if not cp or not verdict or not substantive:
         raise ValueError("Report requires a checkpoint, a substantive body, and an exact verdict")
     markers = text.splitlines()
     if not text.startswith("CHECKPOINT\n") or markers.count("CHECKPOINT") != 1 or markers.count("END CHECKPOINT") != 1:
@@ -1120,9 +1212,9 @@ def main():
     ap.add_argument("--resolve-models", action="store_true",
                     help="show fixed or explicitly overridden IDs/efforts; no provider call")
     ap.add_argument("--think", type=int, default=42000, metavar="TOKENS",
-                    help="aggregate requested Claude thinking ceiling across "
-                         "fresh research turns and synthesis; each call is "
-                         "capped by --claude-tranche-think (default 42000)")
+                    help="aggregate requested Claude thinking ceiling across fresh/resumed "
+                         "research and initial synthesis (default 42000); each call is "
+                         "capped by --claude-tranche-think (default 7000)")
     ap.add_argument("--claude-tranche-think", type=int,
                     default=CLAUDE_TRANCHE_THINK, metavar="TOKENS",
                     help="max Claude extended-thinking tokens in one bounded "
@@ -1226,17 +1318,7 @@ def main():
         protected_inputs = args.context + [os.path.abspath(__file__)]
         if os.path.exists("/dev/fd/0"):
             protected_inputs.append("/dev/fd/0")
-        validate_artifact_paths(artifact_paths, protected_inputs, args.overwrite)
-        for path in artifact_paths:
-            if not path:
-                continue
-            os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-            if os.path.exists(path):
-                atomic_write(path, "", mode=0o600)
-            else:
-                with private_open(path, exclusive=True) as reserved:
-                    reserved.flush()
-                    os.fsync(reserved.fileno())
+        reserve_artifacts(artifact_paths, protected_inputs, args.overwrite)
     except (OSError, ValueError) as error:
         ap.error(str(error))
 
@@ -1374,6 +1456,23 @@ def main():
             )
         atomic_write(save_path, "".join(pieces))
 
+    def finish_interrupted(label="Run interrupted", outcome="INTERRUPTED"):
+        # Try both durable records even if the stop coincided with an I/O failure.
+        for write in (lambda: append_progress(label, "Termination requested; owned cleanup completed."),
+                      lambda: write_snapshot(outcome)):
+            try:
+                write()
+            except OSError as error:
+                try:
+                    print("Could not persist interruption record: " + failure_summary(error), file=sys.stderr)
+                except OSError:
+                    pass
+        try:
+            print(f"\n{SYS_COL}Interrupted; protocol files retained.{RESET}")
+        except OSError:
+            pass
+        return 130
+
     current_round = 0
     consecutive_no_progress = 0
     sessions = {"Claude": {"id": str(uuid.uuid4()), "started": False},
@@ -1410,8 +1509,9 @@ def main():
                     "\nEXTERNAL RECOVERY TRANCHE: Resume the same session. Do no new research, "
                     "invoke no tools, and delegate no work. Return a coherent compressed "
                     "checkpoint report preserving decisive results, with the ACTUAL supported "
-                    "verdict. Use NEW: facts or NONE: explanation. Put long material in a "
-                    "project file; keep this report below 40000 UTF-8 bytes."
+                    "verdict. Use NEW: facts or NONE: explanation. Reference any existing "
+                    "supporting file by path; do not create new files. Keep this report "
+                    "below 40000 UTF-8 bytes."
                 )
             deadline = CLAUDE_RECOVERY_TIMEOUT if recovery else (
                 CLAUDE_TURN_TIMEOUT if who == "Claude" else CODEX_TIMEOUT)
@@ -1443,6 +1543,7 @@ def main():
                         subagents=subagents,
                     )
                 cp, verdict = validate_report(answer)
+                check_shutdown()
                 monitor.observe(cp)
                 break
             except (RuntimeError, ValueError, subprocess.TimeoutExpired) as error:
@@ -1483,13 +1584,13 @@ def main():
     # ~50 ms while streaming); see _SHUTDOWN.
     install_shutdown_handlers()
 
-    interrupted = False
     try:
         for rnd in range(1, args.max_rounds + 1):
             current_round = rnd
             print(f"\n{SYS_COL}{DIM}round {rnd}/{args.max_rounds}{RESET}")
             for step in order:
                 step()
+                check_shutdown()
                 if (len(turns) >= 2 and turns[-1]["verdict"] == "AGREE"
                         and turns[-2]["verdict"] == "AGREE"):
                     consensus = True
@@ -1500,19 +1601,14 @@ def main():
         stalled = True
         print(f"\n{SYS_COL}Debate stalled without substantive progress.{RESET}")
     except KeyboardInterrupt:
-        interrupted = True
-        print(f"\n{SYS_COL}Interrupted.{RESET}")
-        append_progress("Run interrupted", "The user interrupted the debate.")
-        write_snapshot("INTERRUPTED")
+        return finish_interrupted()
     except Exception as e:
+        if termination_pending(e):
+            return finish_interrupted()
         print(f"\n{BOLD}\033[31mError:{RESET} {e}", file=sys.stderr)
         append_progress("Run aborted", str(e))
         write_snapshot(f"ABORTED: {e}")
         sys.exit(1)
-
-    if interrupted:
-        print(f"{SYS_COL}Protocol files retained; no model process left running.{RESET}")
-        return 130
 
     print()
     final_answer = None
@@ -1561,22 +1657,10 @@ def main():
                     f"wall_clock: {fmt_dur(time.perf_counter() - synth_started)}",
                 )
             except KeyboardInterrupt:
-                append_progress(
-                    "Run interrupted during synthesis",
-                    "The active model process group was terminated.",
-                )
-                write_snapshot("INTERRUPTED DURING SYNTHESIS")
-                print(f"\n{SYS_COL}Interrupted during synthesis.{RESET}")
-                return 130
+                return finish_interrupted("Run interrupted during synthesis", "INTERRUPTED DURING SYNTHESIS")
             except Exception as e:
                 if termination_pending(e):
-                    append_progress(
-                        "Run interrupted during synthesis",
-                        "The active model process group was terminated.",
-                    )
-                    write_snapshot("INTERRUPTED DURING SYNTHESIS")
-                    print(f"\n{SYS_COL}Interrupted during synthesis.{RESET}")
-                    return 130
+                    return finish_interrupted("Run interrupted during synthesis", "INTERRUPTED DURING SYNTHESIS")
                 append_progress(
                     "Claude synthesis requires recovery",
                     f"session_id: {synth_session_id}\n"
@@ -1590,7 +1674,7 @@ new research and invoke no tools. Resume this same synthesis session and
 immediately return the best clean, self-contained synthesis already supported
 by the agreed transcript. Include the required six-field checkpoint and exact
 VERDICT: AGREE. Preserve the supported conclusion and keep the report below
-40000 UTF-8 bytes; write longer material to a referenced project file.
+40000 UTF-8 bytes; reference existing supporting files without creating new ones.
 """
                 try:
                     _, final_answer = run_claude(
@@ -1610,20 +1694,12 @@ VERDICT: AGREE. Preserve the supported conclusion and keep the report below
                         f"session_id: {synth_session_id}\nrecovery: yes",
                     )
                 except KeyboardInterrupt:
-                    append_progress(
-                        "Run interrupted during synthesis recovery",
-                        "The active model process group was terminated.",
-                    )
-                    write_snapshot("INTERRUPTED DURING SYNTHESIS RECOVERY")
-                    return 130
+                    return finish_interrupted("Run interrupted during synthesis recovery",
+                                              "INTERRUPTED DURING SYNTHESIS RECOVERY")
                 except Exception as recovery_error:
                     if termination_pending(recovery_error):
-                        append_progress(
-                            "Run interrupted during synthesis recovery",
-                            "The active model process group was terminated.",
-                        )
-                        write_snapshot("INTERRUPTED DURING SYNTHESIS RECOVERY")
-                        return 130
+                        return finish_interrupted("Run interrupted during synthesis recovery",
+                                                  "INTERRUPTED DURING SYNTHESIS RECOVERY")
                     print(
                         f"{SYS_COL}(synthesis and recovery failed; "
                         f"showing last agreed turn){RESET}"
@@ -1658,6 +1734,11 @@ VERDICT: AGREE. Preserve the supported conclusion and keep the report below
     print(f"  {CODEX_COL}Codex{RESET} : {fmt_dur(x_tot)} over {n_x} turn(s)"
           f"{f' (avg {fmt_dur(x_tot / n_x)})' if n_x else ''}")
     print(f"  {SYS_COL}total debate: {fmt_dur(c_tot + x_tot)}{RESET}")
+
+    try:
+        seal_completion()
+    except KeyboardInterrupt:
+        return finish_interrupted()
 
     if save_path:
         outcome = (

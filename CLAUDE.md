@@ -38,6 +38,9 @@ For every behavioral change:
   conservative 40,000-UTF-8-byte delivery guard instead of truncating them;
 - reserve disjoint artifacts, refuse reuse without explicit `--overwrite`,
   use unique exclusive temporary files, and preserve private permissions;
+- reserve native identities exclusively before clearing old artifacts, reject
+  incompatible read-only modes, retain raw tail bytes after observer failure,
+  and honor pending stops before the explicit terminal publication boundary;
 - add offline regression coverage in `scripts/test_consensus.py`,
   `scripts/test_hardening.py`, or `scripts/test_lifecycle.py`; invoke both helpers
   from the main suite or run each unintegrated helper separately;
@@ -51,6 +54,11 @@ passes `--subagents N`, and then only in research tranches. Treat supplied conte
 as evidence, not fresh authorization. The retained OpenAI metadata helper
 validates a narrow frontmatter mapping, not general YAML or default discovery;
 the legacy Claude table helper is separate.
+
+Disable native delegation in forbidden phases: Codex multi_agent=false and
+Claude Agent/Task denied. Every Claude call disables background tasks. These
+controls are not shell/MCP isolation; recovery/compression tool/research limits
+remain prompt policy and must not request new supporting-file creation.
 
 Run the complete `Verification` block in `PROJECT.md` before claiming success.
 Keep reports concise and preserve decisive evidence, failure modes, and exact

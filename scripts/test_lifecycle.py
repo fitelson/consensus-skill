@@ -7,6 +7,8 @@ ledger. Watchdog cleanup never signals a process-name match or a process group.
 Only the runner under test performs its normal owned-group cleanup.
 """
 
+import ast
+import base64
 import json
 import os
 from pathlib import Path
@@ -30,6 +32,8 @@ SELF = Path(__file__).resolve()
 CALL_CAP = 2.0
 WATCHDOG = 20
 TAIL = "LIFECYCLE_SIGTERM_TAIL"
+BURST_STDOUT = b'{"type":"assistant","text":"' + b"x" * 196608
+BURST_STDERR = bytes(range(256)) * 16
 
 
 FAKE_CLI = r'''
@@ -101,6 +105,17 @@ if mode in {"raw-flood", "capture-flood", "mixed-flood"}:
         time.sleep(0.005)
 
 prompt = sys.stdin.read()
+if mode == "observer-burst":
+    # Finish a bounded burst before the observer is allowed to reject it.
+    for descriptor, payload in (
+        (1, b'{"type":"assistant","text":"' + b"x" * 196608),
+        (2, bytes(range(256)) * 16),
+    ):
+        remaining = memoryview(payload)
+        while remaining:
+            remaining = remaining[os.write(descriptor, remaining):]
+    (root / "writer-completed").write_text("done", encoding="utf-8")
+    sys.exit(0)
 counter_path = root / (provider + ".count")
 count = int(counter_path.read_text()) + 1 if counter_path.exists() else 1
 counter_path.write_text(str(count), encoding="utf-8")
@@ -118,6 +133,13 @@ append("calls.jsonl", {
     "argv": args,
 })
 if provider == "codex":
+    if mode == "healthy-tail" and not resumed:
+        os.write(2, b"startup before queued controls\n")
+        deadline = time.monotonic() + 4
+        while not (root / "startup-journal-blocked").exists():
+            if time.monotonic() >= deadline:
+                raise RuntimeError("startup journal did not reach the handshake")
+            time.sleep(0.01)
     print(json.dumps({"type": "thread.started", "thread_id": session}), flush=True)
 
 if mode == "eof" or (mode == "cap-recovery" and count == 1):
@@ -128,6 +150,8 @@ if mode == "eof" or (mode == "cap-recovery" and count == 1):
     sys.exit(0)
 
 verdict = "DISAGREE" if mode == "tranches" and count == 1 else "AGREE"
+if mode == "final-disagree" and provider == "codex":
+    verdict = "DISAGREE"
 report = (
     "CHECKPOINT\nelapsed: 1 second\ntentative_verdict: " + verdict +
     "\nnew_results: NEW: verified " + provider + " tranche " + str(count) +
@@ -144,11 +168,25 @@ if provider == "claude":
     print(json.dumps({"type": "result", "subtype": "success",
                       "is_error": False, "result": report}), flush=True)
 else:
+    if mode == "healthy-tail" and not resumed:
+        print(json.dumps({"type": "item.completed", "item": {
+            "type": "agent_message", "text": report,
+        }}), flush=True)
+        time.sleep(60)
+        sys.exit(0)
     output = Path(args[args.index("-o") + 1])
-    output.write_text(report, encoding="utf-8")
+    if mode == "fifo":
+        output.unlink()  # Only the runner's disposable fake-provider output.
+        os.mkfifo(output, 0o600)
+        (root / "fifo-created").write_text(str(output), encoding="utf-8")
+    else:
+        output.write_text(report, encoding="utf-8")
     print(json.dumps({"type": "item.completed", "item": {
         "type": "agent_message", "text": report,
     }}), flush=True)
+    if mode == "live-control":
+        (root / "signal-ready").write_text("active provider", encoding="utf-8")
+        time.sleep(60)
     print(json.dumps({"type": "turn.completed"}), flush=True)
 '''
 
@@ -203,6 +241,24 @@ def load_runner():
     return module
 
 
+def streaming_finally_boundary():
+    """Find the actual cleanup call, not an earlier leader-exit cleanup."""
+    tree = ast.parse(RUNNER.read_bytes(), filename=str(RUNNER))
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef) and node.name == "_run_streaming")
+    calls = []
+    for statement in function.body:
+        if isinstance(statement, ast.Try):
+            for final in statement.finalbody:
+                calls.extend(node for node in ast.walk(final)
+                             if isinstance(node, ast.Call)
+                             and isinstance(node.func, ast.Name)
+                             and node.func.id == "_terminate_process_group")
+    if len(calls) != 1:
+        raise AssertionError("expected one _run_streaming finally cleanup call")
+    return calls[0].lineno, calls[0].end_lineno
+
+
 def worker(action):
     """One isolated runner invocation; the parent owns the outer deadline."""
     root = Path(os.environ["LIFECYCLE_CASE"])
@@ -217,6 +273,73 @@ def worker(action):
     original_popen = subprocess.Popen
     original_start = threading.Thread.start
     original_queue = queue.Queue
+    original_cleanup = runner._terminate_process_group
+    original_codex = runner.run_codex
+    original_killpg = os.killpg
+    original_fsync = os.fsync
+    owned_processes = []
+    reader_eof = set()
+    readers_finished = threading.Event()
+    queued_controls = threading.Event()
+    main_stop = action == "main-stop"
+    mode = os.environ["LIFECYCLE_MODE"]
+    boundary = streaming_finally_boundary() if main_stop or action == "codex-fifo-stop" else None
+
+    def await_external_stop(label):
+        if runner.shutdown_requested():
+            raise AssertionError("stop was already latched before handshake")
+        stats["signal_boundary"] = label
+        (root / "signal-ready").write_text(label, encoding="utf-8")
+        deadline = time.monotonic() + 4
+        while not runner.shutdown_requested() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        if not runner.shutdown_requested():
+            raise AssertionError("external SIGTERM did not reach the shutdown latch")
+
+    def boundary_cleanup(proc, pgid):
+        original_cleanup(proc, pgid)
+        caller = sys._getframe(1)
+        if not boundary or caller.f_code.co_name != "_run_streaming" \
+                or not boundary[0] <= caller.f_lineno <= boundary[1]:
+            return
+        stats["successful_cleanups"] = stats.get("successful_cleanups", 0) + 1
+        target = 1 if action == "codex-fifo-stop" else (3 if mode == "synthesis-cleanup" else 2)
+        if mode in {"live-control", "research-oserror"} or stats["successful_cleanups"] != target:
+            return
+        if proc.returncode != 0:
+            raise AssertionError("cleanup boundary was not a successful provider exit")
+        stats["boundary_provider_returncode"] = proc.returncode
+        await_external_stop("successful streaming finally cleanup")
+
+    def research_oserror(*args, **kwargs):
+        if action in {"healthy-tail", "main-tail"} and not kwargs.get("session", {}).get("id"):
+            with mock.patch.object(os, "fsync", side_effect=delay_startup_journal):
+                result = original_codex(*args, **kwargs)
+        else:
+            result = original_codex(*args, **kwargs)
+        if main_stop and mode == "research-oserror":
+            await_external_stop("completed research transport before injected OSError")
+            stats["injected_research_oserror"] = True
+            raise OSError("injected research I/O failure after SIGTERM")
+        return result
+
+    def delay_startup_journal(descriptor):
+        if not stats.get("delayed_startup_journal"):
+            stats["delayed_startup_journal"] = True
+            (root / "startup-journal-blocked").write_text("blocked", encoding="utf-8")
+            if not queued_controls.wait(4):
+                raise AssertionError("session and checkpoint did not reach the queue")
+            # Expire the live-call cap with controls queued and a healthy observer.
+            time.sleep(1.2 if action == "main-tail" else 0.7)
+        return original_fsync(descriptor)
+
+    def recorded_killpg(pgid, sig):
+        if action == "cleanup-stop" and sig in {signal.SIGTERM, signal.SIGKILL}:
+            stats.setdefault("group_signals", []).append({
+                "pgid": pgid, "signal": int(sig), "time": time.monotonic(),
+                "stopping": runner.shutdown_requested(),
+            })
+        return original_killpg(pgid, sig)
 
     def recorded_popen(command, *args, **kwargs):
         executable = command[0]
@@ -227,6 +350,7 @@ def worker(action):
         elif executable != sys.executable or command[1] != str(root / "bin" / "fixture"):
             raise AssertionError("unexpected child executable")
         proc = original_popen(command, *args, **kwargs)
+        owned_processes.append(proc)
         append_record(root / "owned-pids.jsonl", {"pid": proc.pid, "role": "provider"})
         return proc
 
@@ -243,6 +367,18 @@ def worker(action):
                     time.sleep(0.15)  # Tail reaches the queue after termination.
             super().put(item, *args, **kwargs)
             stats["queue_peak"] = max(stats["queue_peak"], self.qsize())
+            if action in {"healthy-tail", "main-tail"} and isinstance(item, tuple) \
+                    and item[0] == "stdout" and isinstance(item[1], bytes):
+                if b"thread.started" in item[1]:
+                    stats["queued_session"] = True
+                if b"END CHECKPOINT" in item[1]:
+                    stats["queued_checkpoint"] = True
+                if stats.get("queued_session") and stats.get("queued_checkpoint"):
+                    queued_controls.set()
+            if action == "observer-overflow" and isinstance(item, tuple) and item[1] is None:
+                reader_eof.add(item[0])
+                if len(reader_eof) == 2:
+                    readers_finished.set()
 
     starts = 0
 
@@ -263,23 +399,63 @@ def worker(action):
     def observe(_stream, text):
         stats["observer_bytes"] += len(text.encode("utf-8"))
 
-    signal.signal(signal.SIGTERM, interrupt)
+    observer = None
+    if action == "observer-overflow":
+        runner.EVENT_MAX_BYTES = 1024
+        observer = runner.stream_observer("Claude")
+
+    def overflow_observer(stream, text):
+        stats["observer_calls"] = stats.get("observer_calls", 0) + 1
+        if stats.get("observer_failed"):
+            stats["observer_calls_after_failure"] = stats.get("observer_calls_after_failure", 0) + 1
+        if stream == "stdout" and not stats.get("burst_retained_before_failure"):
+            deadline = time.monotonic() + 4
+            if not wait_for_file(root / "writer-completed", None, deadline) \
+                    or not readers_finished.wait(max(0, deadline - time.monotonic())):
+                raise AssertionError("writer burst was not fully retained before observer failure")
+            owned_processes[0].wait(timeout=max(0.01, deadline - time.monotonic()))
+            stats["burst_retained_before_failure"] = True
+        try:
+            observer(stream, text)
+        except runner.StreamLimitExceeded:
+            stats["observer_failed"] = True
+            raise
+
+    if action in {"cleanup-stop", "codex-fifo-stop"}:
+        runner.install_shutdown_handlers()
+    else:
+        signal.signal(signal.SIGTERM, interrupt)
     started = time.monotonic()
     monitor = None
     try:
         with mock.patch.object(subprocess, "Popen", recorded_popen), \
                 mock.patch.object(queue, "Queue", RecordingQueue), \
-                mock.patch.object(threading.Thread, "start", injected_start):
-            if action == "main":
-                cap = "2" if os.environ["LIFECYCLE_MODE"] == "cap-recovery" else "5"
+                mock.patch.object(threading.Thread, "start", injected_start), \
+                mock.patch.object(runner, "_terminate_process_group", boundary_cleanup), \
+                mock.patch.object(runner, "run_codex", research_oserror), \
+                mock.patch.object(os, "killpg", recorded_killpg):
+            if action in {"main", "main-tail"} or main_stop:
+                cap = "1" if action == "main-tail" else (
+                    "2" if os.environ["LIFECYCLE_MODE"] == "cap-recovery" else "5")
                 sys.argv = [
-                    str(RUNNER), "--quiet", "--max-rounds", "2", "--no-synthesize",
+                    str(RUNNER), "--quiet", "--max-rounds", "1" if main_stop else "2",
                     "--claude-turn-timeout", cap, "--codex-timeout", cap,
                     "--claude-recovery-timeout", "5", "--save", str(root / "debate.md"),
                     "--progress", str(root / "progress.md"), "offline lifecycle fixture",
                 ]
+                if not main_stop or mode not in {"synthesis-cleanup", "pending-synthesis"}:
+                    sys.argv.insert(1, "--no-synthesize")
                 stats["main_return"] = runner.main()
-            elif action in {"claude-eof", "codex-eof"}:
+            elif action == "healthy-tail":
+                session = {}
+                stats["tail_session"] = session
+                stats["tail_checkpoints"] = []
+                research_oserror(
+                    "offline fixture", timeout=0.5, session=session,
+                    stream_journal=root / "journal.jsonl",
+                    checkpoint_report=stats["tail_checkpoints"].append,
+                )
+            elif action in {"claude-eof", "codex-eof", "codex-fifo", "codex-fifo-stop"}:
                 resumed = os.environ.get("LIFECYCLE_RESUME") == "1"
                 session = "11111111-1111-4111-8111-111111111111"
                 if action == "claude-eof":
@@ -306,32 +482,73 @@ def worker(action):
                     2 if action.endswith("limit") else CALL_CAP)
                 if action == "semantic-stop":
                     monitor = runner.CheckpointMonitor(interval=0.15)
+                if action == "cleanup-stop":
+                    timeout = 0.5
+                elif action == "observer-overflow":
+                    timeout = 6
+                text_observer = runner.stream_observer("Claude", monitor) if monitor else observe
+                if observer:
+                    text_observer = overflow_observer
                 runner._run_streaming(
                     [sys.executable, str(root / "bin" / "fixture")], dict(os.environ),
                     timeout, stdin_text="offline fixture", stream_journal=root / "journal.jsonl",
-                    text_observer=runner.stream_observer("Claude", monitor) if monitor else observe,
-                    semantic_monitor=monitor,
+                    text_observer=text_observer, semantic_monitor=monitor,
+                    capture_output=action != "observer-overflow",
                 )
                 stats["returned"] = True
     except BaseException as error:
         stats["exception"] = type(error).__name__
         stats["exception_text"] = str(error)[:500]
+        if isinstance(error, SystemExit):
+            stats["system_exit"] = error.code
         stdout, stderr = getattr(error, "output", None), getattr(error, "stderr", None)
         stats["stdout_bytes"] = len(stdout.encode("utf-8")) if isinstance(stdout, str) else 0
         stats["stderr_bytes"] = len(stderr.encode("utf-8")) if isinstance(stderr, str) else 0
         stats["stdout_tail"] = isinstance(stdout, str) and TAIL in stdout
         stats["stderr_tail"] = isinstance(stderr, str) and TAIL + "_STDERR" in stderr
     stats["elapsed"] = time.monotonic() - started
+    stats["shutdown_latched"] = runner.shutdown_requested()
+    stats["latched_signal"] = runner._SHUTDOWN["signal"]
+    stats["provider_returncodes"] = [proc.poll() for proc in owned_processes]
     if monitor:
         stats["semantic_misses"] = monitor.misses
         stats["semantic_failed"] = monitor.failed
     stats["live_reader_threads"] = [thread.name for thread in threading.enumerate()
                                     if thread is not threading.main_thread()]
     (root / "result.json").write_text(json.dumps(stats), encoding="utf-8")
+    if main_stop:
+        return stats.get("main_return", stats.get("system_exit", 1))
+    return 0
 
 
 @unittest.skipUnless(os.name == "posix", "process-group regressions require POSIX")
 class LifecycleTests(unittest.TestCase):
+    def test_healthy_timeout_tail_preserves_queued_session_and_checkpoint(self):
+        outcome = self.drive("healthy-tail", "healthy-tail")
+        stats = outcome["stats"]
+        self.assertEqual(stats.get("exception"), "TimeoutExpired")
+        self.assertTrue(stats["queued_session"])
+        self.assertTrue(stats["queued_checkpoint"])
+        self.assertEqual(stats["tail_session"], {"id": "11111111-1111-4111-8111-111111111111"})
+        self.assertEqual(len(stats["tail_checkpoints"]), 1)
+        self.assertIn("verified codex tranche 1", stats["tail_checkpoints"][0]["new_results"])
+        journal = outcome["journals"]["journal.jsonl"]["text"]
+        self.assertIn("thread.started", journal)
+        self.assertIn("END CHECKPOINT", journal)
+
+    def test_healthy_timeout_tail_enables_targeted_same_session_recovery(self):
+        outcome = self.drive("main-tail", "healthy-tail")
+        self.assertNotIn("exception", outcome["stats"])
+        self.assertIn("CONSENSUS REACHED", outcome["debate.md"])
+        codex_calls = [call for call in outcome["calls"] if call["provider"] == "codex"]
+        self.assertEqual(len(codex_calls), 2)
+        self.assertFalse(codex_calls[0]["resumed"])
+        self.assertTrue(codex_calls[1]["resumed"])
+        self.assertTrue(codex_calls[1]["recovery"])
+        self.assertEqual(codex_calls[0]["session"], codex_calls[1]["session"])
+        self.assertIn("verified codex tranche 1", outcome["progress.md"])
+        self.assertIn("recovery: yes", outcome["progress.md"])
+
     def test_termination_tail_checkpoint_cannot_undo_two_miss_stop(self):
         outcome = self.drive("semantic-stop", "semantic-tail")
         stats = outcome["stats"]
@@ -347,7 +564,8 @@ class LifecycleTests(unittest.TestCase):
         self.root = Path(temporary.name)
         self.sequence = 0
 
-    def drive(self, action, mode, *, fail_start=0, resume=False, signals=False):
+    def drive(self, action, mode, *, fail_start=0, resume=False, signals=False,
+              boundary_signal=False, cleanup_signal=False, expected_exit=0):
         self.sequence += 1
         root = self.root / str(self.sequence)
         (root / "bin").mkdir(parents=True)
@@ -381,6 +599,17 @@ class LifecycleTests(unittest.TestCase):
                     [sys.executable, "-B", str(SELF), "--worker", action], env=environment,
                     cwd=root, stdout=out, stderr=err, start_new_session=True,
                 )
+                if boundary_signal:
+                    self.assertTrue(wait_for_file(root / "signal-ready", proc, deadline),
+                                    "worker never reached the requested signal boundary")
+                    proc.send_signal(signal.SIGTERM)
+                elif cleanup_signal:
+                    self.assertTrue(wait_for_file(root / "term-received", proc, deadline),
+                                    "ordinary cleanup never delivered TERM to the owned fixture")
+                    # Distinguish original-TERM+2 from signal-arrival+2 as well
+                    # as the old five-second grace, with a generous timing band.
+                    time.sleep(1)
+                    proc.send_signal(signal.SIGTERM)
                 if signals:
                     self.assertTrue(wait_for_file(root / "fixture-ready", proc, deadline),
                                     "fixture never became ready for cancellation")
@@ -407,6 +636,8 @@ class LifecycleTests(unittest.TestCase):
                 outcome["calls"] = read_records(root / "calls.jsonl")
                 outcome["pipes_closed"] = (root / "pipes-closed").exists()
                 outcome["term_received"] = (root / "term-received").exists()
+                outcome["fifo_created"] = (root / "fifo-created").exists()
+                outcome["writer_completed"] = (root / "writer-completed").exists()
         except BaseException as error:
             pending_error = error
         finally:
@@ -424,24 +655,144 @@ class LifecycleTests(unittest.TestCase):
             raise pending_error
         outcome["stdout"] = (root / "worker.stdout").read_text(encoding="utf-8")
         outcome["stderr"] = (root / "worker.stderr").read_text(encoding="utf-8")
+        for name in ("debate.md", "progress.md"):
+            path = root / name
+            outcome[name] = path.read_text(encoding="utf-8") if path.exists() else ""
         outcome["journals"] = {}
         for path in (root / "journal.jsonl", root / "progress.md.claude-stream.jsonl",
                      root / "progress.md.codex-stream.jsonl"):
             if path.exists():
+                rows = read_records(path)
                 outcome["journals"][path.name] = {
-                    "text": "".join(row.get("line", "") for row in read_records(path)),
+                    "text": "".join(row.get("line", "") for row in rows),
+                    "raw": {
+                        stream: b"".join(base64.b64decode(row["raw_b64"], validate=True)
+                                         for row in rows if row.get("stream") == stream)
+                        for stream in ("stdout", "stderr")
+                    },
                     "mode": stat.S_IMODE(path.stat().st_mode),
                 }
         self.assertFalse(fired, f"outer watchdog fired: {action}; {outcome['stderr'][-1000:]}")
-        self.assertEqual(outcome["returncode"], 0, outcome["stderr"][-1000:])
+        self.assertEqual(outcome["returncode"], expected_exit,
+                         {"stats": outcome["stats"], "stderr": outcome["stderr"][-1000:]})
         self.assertTrue(outcome["owned_pids"], "no fake process was actually started")
         self.assertEqual(outcome["live_pids_before_cleanup"], [],
                          "runner leaked owned processes before watchdog cleanup")
         self.assertFalse(outcome["stats"].get("live_reader_threads"),
-                         "runner left output reader or stdin feeder threads alive")
+                         "runner left output reader or stdin feeder threads alive: "
+                         + str(outcome["stats"]))
         for journal in outcome["journals"].values():
             self.assertEqual(journal["mode"], 0o600)
         return outcome
+
+    def test_codex_fifo_output_is_rejected_without_blocking(self):
+        for resumed in (False, True):
+            with self.subTest(resumed=resumed):
+                outcome = self.drive("codex-fifo", "fifo", resume=resumed)
+                self.assertTrue(outcome["fifo_created"])
+                self.assertEqual(outcome["stats"].get("exception"), "RuntimeError")
+                self.assertIn("not a regular file", outcome["stats"]["exception_text"])
+                self.assertLess(outcome["stats"]["elapsed"], 4)
+                self.assertEqual(outcome["stats"]["provider_returncodes"], [0])
+                self.assertEqual(len(outcome["calls"]), 1)
+                self.assertEqual(outcome["calls"][0]["resumed"], resumed)
+
+    def test_codex_fifo_output_with_late_sigterm_does_not_hang(self):
+        outcome = self.drive("codex-fifo-stop", "fifo", boundary_signal=True)
+        self.assertTrue(outcome["fifo_created"])
+        self.assertEqual(outcome["stats"].get("exception"), "ShutdownRequested")
+        self.assertEqual(outcome["stats"]["latched_signal"], signal.SIGTERM)
+        self.assertEqual(outcome["stats"]["boundary_provider_returncode"], 0)
+        self.assertEqual(len(outcome["calls"]), 1)
+        self.assertLess(outcome["stats"]["elapsed"], 4)
+
+    def test_completed_burst_is_fully_journaled_after_observer_overflow(self):
+        outcome = self.drive("observer-overflow", "observer-burst")
+        stats = outcome["stats"]
+        self.assertTrue(outcome["writer_completed"])
+        self.assertTrue(stats["burst_retained_before_failure"])
+        self.assertEqual(stats.get("exception"), "StreamLimitExceeded")
+        self.assertIn("individual JSON event", stats["exception_text"])
+        self.assertTrue(stats["observer_failed"])
+        self.assertEqual(stats.get("observer_calls_after_failure", 0), 0)
+        self.assertEqual(stats["provider_returncodes"], [0])
+        raw = outcome["journals"]["journal.jsonl"]["raw"]
+        self.assertEqual(raw["stdout"], BURST_STDOUT)
+        self.assertEqual(raw["stderr"], BURST_STDERR)
+        self.assertLess(len(BURST_STDOUT) + len(BURST_STDERR), stats["raw_limit"])
+        self.assertLessEqual(stats["queue_peak"], 64)
+        self.assertLess(stats["elapsed"], 5)
+
+    def assert_interrupted_main(self, mode, calls):
+        outcome = self.drive("main-stop", mode, boundary_signal=True, expected_exit=130)
+        stats = outcome["stats"]
+        self.assertNotIn("exception", stats)
+        self.assertEqual(stats["main_return"], 130)
+        self.assertTrue(stats["shutdown_latched"])
+        self.assertEqual(stats["latched_signal"], signal.SIGTERM)
+        self.assertEqual(len(outcome["calls"]), calls, "stop must not spawn recovery or synthesis")
+        self.assertEqual(stats["provider_returncodes"], [0] * calls)
+        transcript = outcome["debate.md"]
+        self.assertIn("## Outcome\n", transcript)
+        terminal = transcript.split("## Outcome\n", 1)[1].splitlines()[0]
+        self.assertIn("INTERRUPTED", terminal)
+        self.assertNotIn("CONSENSUS", terminal)
+        self.assertNotIn("ABORTED", transcript)
+        progress = outcome["progress.md"]
+        self.assertIn("Run interrupted", progress)
+        self.assertEqual(progress.count("Run interrupted"), 1)
+        self.assertNotIn("Run completed", progress)
+        self.assertNotIn("Run aborted", progress)
+        self.assertNotIn("invalid report", progress)
+        self.assertNotIn("recovery: yes", progress)
+        return outcome
+
+    def test_sigterm_during_last_agreement_cleanup_is_interrupted_without_synthesis(self):
+        outcome = self.assert_interrupted_main("final-agree", 2)
+        self.assertEqual(outcome["stats"]["successful_cleanups"], 2)
+        self.assertEqual(outcome["stats"]["boundary_provider_returncode"], 0)
+
+    def test_sigterm_during_final_disagree_cleanup_is_interrupted(self):
+        outcome = self.assert_interrupted_main("final-disagree", 2)
+        self.assertEqual(outcome["stats"]["successful_cleanups"], 2)
+        self.assertIn("VERDICT: DISAGREE", outcome["journals"]["progress.md.codex-stream.jsonl"]["text"])
+
+    def test_sigterm_during_successful_synthesis_cleanup_is_interrupted(self):
+        outcome = self.assert_interrupted_main("synthesis-cleanup", 3)
+        self.assertEqual(outcome["stats"]["successful_cleanups"], 3)
+        self.assertEqual(outcome["stats"]["boundary_provider_returncode"], 0)
+        self.assertIn("Claude synthesis session started", outcome["progress.md"])
+        # The earlier research agreement is legitimately already on stdout.
+        self.assertIn("CONSENSUS REACHED", outcome["stdout"])
+
+    def test_active_cancellation_and_pending_synthesis_controls_stay_interrupted(self):
+        for mode in ("live-control", "pending-synthesis"):
+            with self.subTest(mode=mode):
+                self.assert_interrupted_main(mode, 2)
+
+    def test_sigterm_takes_priority_over_injected_research_oserror(self):
+        outcome = self.assert_interrupted_main("research-oserror", 2)
+        self.assertTrue(outcome["stats"]["injected_research_oserror"])
+
+    def test_stop_during_cleanup_shortens_grace_from_original_term_time(self):
+        outcome = self.drive("cleanup-stop", "resist", cleanup_signal=True)
+        stats = outcome["stats"]
+        self.assertEqual(stats.get("exception"), "ShutdownRequested")
+        self.assertTrue(stats["shutdown_latched"])
+        self.assertEqual(stats["latched_signal"], signal.SIGTERM)
+        signals = stats["group_signals"]
+        terms = [entry for entry in signals if entry["signal"] == signal.SIGTERM]
+        kills = [entry for entry in signals if entry["signal"] == signal.SIGKILL]
+        self.assertEqual(len(terms), 1)
+        self.assertEqual(len(kills), 1)
+        self.assertFalse(terms[0]["stopping"], "TERM must precede the external stop")
+        self.assertTrue(kills[0]["stopping"])
+        self.assertEqual(terms[0]["pgid"], kills[0]["pgid"])
+        self.assertIn(terms[0]["pgid"], outcome["owned_pids"])
+        term_to_kill = kills[0]["time"] - terms[0]["time"]
+        self.assertGreaterEqual(term_to_kill, 1.8)
+        self.assertLess(term_to_kill, 2.75, "cleanup kept or restarted its old TERM grace")
+        self.assertEqual(stats["provider_returncodes"], [-signal.SIGKILL])
 
     def assert_capped_eof(self, provider):
         for resumed in (False, True):
@@ -479,8 +830,10 @@ class LifecycleTests(unittest.TestCase):
 
     def test_repeated_sigterm_does_not_interrupt_cleanup_escalation(self):
         outcome = self.drive("repeated-signal", "resist", signals=True)
-        self.assertEqual(outcome["stats"].get("exception"), "KeyboardInterrupt")
+        self.assertEqual(outcome["stats"].get("exception"), "ShutdownRequested")
         self.assertEqual(outcome["stats"]["interrupts"], 1)
+        self.assertTrue(outcome["stats"]["shutdown_latched"])
+        self.assertEqual(outcome["stats"]["latched_signal"], signal.SIGTERM)
         self.assertTrue(outcome["term_received"])
         self.assertLess(outcome["stats"]["elapsed"], 12)
 
@@ -560,6 +913,6 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     if len(sys.argv) == 3 and sys.argv[1] == "--worker":
-        worker(sys.argv[2])
+        raise SystemExit(worker(sys.argv[2]))
     else:
         unittest.main()

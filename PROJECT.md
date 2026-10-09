@@ -77,6 +77,9 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Preserve these properties:
     or provider calls, including canonical-path and same-inode aliases. Refuse
     existing outputs unless `--overwrite` explicitly authorizes reuse; this
     never authorizes collisions or symlink redirection.
+    Exclusively reserve new files and compare native identities, including fresh
+    case aliases, before replacing old content. Preflight preserved owner-write
+    permissions; retain failed new reservations without deleting prior files.
 14. Use unique exclusive temporary files, private artifact creation, and
     permission-preserving replacements. All new main artifacts, including the
     transcript, use mode `0600`. Fsync written content and destination
@@ -88,6 +91,11 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Preserve these properties:
     raw streams to 64 MB by default, and the queue to 64 chunks of at most
     64 KiB each. Media/tool/partial events remain in the private disk journal,
     not cumulative memory capture. Do not claim unlimited lossless tail capture.
+    Raw termination-tail draining is independent of semantic observer failure.
+    Reject nonregular provider outputs through nonblocking/no-follow opens.
+    Honor pending stops after cleanup, before accepting reports and sealing
+    terminal publication; coherent interruption returns 130 even on I/O failure.
+    Once completion is sealed, later signals do not cancel that terminal decision.
 16. Keep the retained OpenAI metadata helper a narrow frontmatter mapping
     validator: reject malformed supported forms, duplicate mapping fields, and
     nested/body model examples. Do not advertise general YAML validation or
@@ -95,10 +103,15 @@ Protocol identity is `PROTOCOL_VERSION = 3`. Preserve these properties:
 
 17. Forbid sub-agents by default. `--subagents N` permits up to N concurrent
     same-model sub-agents in research tranches only, never in recovery,
-    compression, or synthesis. Claude research calls with sub-agents must
-    disable background tasks. Codex research calls must pass the
+    compression, or synthesis. All Claude calls disable background tasks and
+    deny Agent/Task when N=0. Codex N=0 calls explicitly disable multi_agent;
+    positive-N research calls must pass the
     multi-agent feature, a concurrency cap of N, and depth 1. Claude messages
     tagged with `parent_tool_use_id` are never checkpoints or reports.
+
+Native delegation controls do not isolate ordinary shell/MCP access. Recursive
+model calls, semantic truthfulness, and recovery tool/research restrictions
+remain prompt policy; do not claim a security sandbox from these controls.
 
 Research, recovery, compression, and synthesis all prohibit recursive consensus
 and calls to another model. Context and peer reports are evidence, not
@@ -234,3 +247,33 @@ answers were correct.
 
 This is a single short run. It does not exercise a sub-agent batch long enough
 to approach the semantic checkpoint deadline.
+
+October 9, 2026 audit closure and release verification. Completed the inherited
+adversarial audit (13 findings) and independent precommit follow-up (two
+findings), reviewed the final repairs, and added two lifecycle regressions for
+queued healthy timeout-tail controls. These verify that session IDs and
+checkpoints survive cleanup and permit targeted same-session recovery. An
+in-memory mutation restoring the discarded capture condition fails both tests.
+
+The final diff fixes native artifact reservation/overwrite safety, read-only
+preflight, nonregular provider-output hangs, observer-error tail retention,
+control-only report acceptance, literal progress tokens, cancellation/cleanup
+boundaries, and inherited-environment/delegation coverage. Existing model pins,
+timers, report guards, and sub-agent defaults are unchanged. No unresolved
+actionable defect was found in this scoped final review.
+
+The full offline acceptance command passed twice, including an explicit
+`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` run. Each integrated gate ran 116
+hardening tests and 26 lifecycle tests, with no skips, plus the main
+orchestration/interruption/parser assertions. Skill metadata, compilation of
+all four Python files, and whitespace checks passed. Four focused lifecycle
+cases and the expected-failure mutation check also passed.
+
+The gate used an external test-only retention wrapper for disposable files:
+TemporaryDirectory/NamedTemporaryFile cleanup was suppressed and the FIFO
+fixture's old output was renamed rather than unlinked. No assertions were
+omitted; ordinary temporary-file deletion is not certified by this mode.
+Private audit reports, logs, fixtures, and raw journals remain outside Git.
+No live provider calls or unrelated installed settings were changed. Offline
+acceptance does not certify live-provider behavior or same-user filesystem
+isolation; these limits remain explicit in the operations reference.
